@@ -54,7 +54,6 @@ def init_db():
     with db_conn() as con:
         cur = con.cursor()
 
-        # paid plans
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS plans(
@@ -65,7 +64,6 @@ def init_db():
             """
         )
 
-        # free trial usage
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS free_trials(
@@ -75,7 +73,6 @@ def init_db():
             """
         )
 
-        # settings
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS settings(
@@ -157,7 +154,6 @@ def days_left(user_id: int) -> int:
 
 
 def has_access(plan: str) -> bool:
-    # paid plans that can analyze indefinitely
     return plan in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO")
 
 
@@ -192,12 +188,12 @@ def inc_free_used(user_id: int):
 PLANS_TEXT = """\
 💎 Trading AI – Plans
 
-$49  - VIP_GOLD (XAUUSD, M5/M15)  ✅ High accuracy focus
+$49  - VIP_GOLD (XAUUSD, M5/M15)
 $99  - VIP_ALL  (All pairs & timeframes)
 $119 - VIP_PRO  (VIP_ALL + priority updates)
 
 🎁 Free Trial:
-• 5 chart analyses for FREE, then subscription required.
+• 5 chart analyses FREE, then subscription required.
 
 To subscribe, contact admin.
 """
@@ -221,17 +217,15 @@ Send a chart image (candles only OK).
 Bot returns: BUY/SELL/WAIT + Entry/SL/TP1/TP2/TP3 + Confidence.
 """
 
-
 DISCLAIMER = "⚠️ Educational only | Risk 1–2%"
 
 
 # =========================
-# Thresholds
+# Thresholds / Prompts
 # =========================
 def required_threshold(plan: str) -> int:
     mode = current_mode()
 
-    # Free trial: keep quality decent (you can change this)
     if plan == "FREE_TRIAL":
         return 70 if mode == "ALL" else 74
 
@@ -277,13 +271,11 @@ def fmt_signal(res: Dict[str, Any], plan: str, trial_remaining: Optional[int] = 
     note = (res.get("note") or "").strip()
     note_line = f"\n🧠 Note: {note}" if note else ""
 
-    if action == "WAIT":
-        trial_line = ""
-        if plan == "FREE_TRIAL" and trial_remaining is not None:
-            trial_line = f"\n🧪 Free Trial remaining: {trial_remaining}"
-        elif plan == "FREE":
-            trial_line = "\n🧪 Free Trial: send a chart to start."
+    trial_line = ""
+    if plan == "FREE_TRIAL" and trial_remaining is not None:
+        trial_line = f"\n🧪 Free Trial remaining: {trial_remaining}/{FREE_TRIAL_LIMIT}"
 
+    if action == "WAIT":
         return (
             f"🟡 WAIT | {pair} {tf} | {conf}%\n\n"
             f"No clean confirmation.\n"
@@ -293,23 +285,13 @@ def fmt_signal(res: Dict[str, Any], plan: str, trial_remaining: Optional[int] = 
             f"{DISCLAIMER}"
         ).strip()
 
-    entry = res.get("entry")
-    sl = res.get("sl")
-    tp1 = res.get("tp1")
-    tp2 = res.get("tp2")
-    tp3 = res.get("tp3")
-
-    trial_line = ""
-    if plan == "FREE_TRIAL" and trial_remaining is not None:
-        trial_line = f"\n🧪 Free Trial remaining: {trial_remaining}"
-
     return (
         f"🟢 {action} | {pair} {tf} | {bias} | {conf}%\n\n"
-        f"🎯 Entry: {entry}\n"
-        f"🛑 SL: {sl}\n"
-        f"✅ TP1: {tp1}\n"
-        f"✅ TP2: {tp2}\n"
-        f"✅ TP3: {tp3}"
+        f"🎯 Entry: {res.get('entry')}\n"
+        f"🛑 SL: {res.get('sl')}\n"
+        f"✅ TP1: {res.get('tp1')}\n"
+        f"✅ TP2: {res.get('tp2')}\n"
+        f"✅ TP3: {res.get('tp3')}"
         f"{note_line}"
         f"{trial_line}\n\n"
         f"{DISCLAIMER}"
@@ -317,7 +299,7 @@ def fmt_signal(res: Dict[str, Any], plan: str, trial_remaining: Optional[int] = 
 
 
 # =========================
-# OpenAI (blocking)
+# OpenAI Vision (blocking)
 # =========================
 def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str, Any]], str]:
     if not OPENAI_API_KEY:
@@ -347,7 +329,7 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
         "- If action is WAIT: entry/sl/tp1/tp2/tp3 must be null.\n"
         "- If BUY/SELL: MUST provide entry, sl, tp1,tp2,tp3.\n"
         "- Keep note short (<= 120 chars).\n"
-        "- If image has only candles: still analyze using price action, trend, structure, key levels.\n"
+        "- If image has ONLY candles: still analyze using price action, trend, structure, key levels.\n"
         "- Prefer high accuracy over frequent signals.\n"
     )
 
@@ -360,7 +342,7 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # ✅ FIXED: use input_text (NOT text)
+    # ✅ IMPORTANT: use input_text (NOT text) — this fixes your error forever
     payload = {
         "model": DEFAULT_MODEL,
         "input": [
@@ -391,15 +373,17 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
 
         data = r.json()
 
-        # Try common shapes
+        # Prefer output_text
         text = (data.get("output_text") or "").strip()
+
+        # Fallback parse
         if not text:
             try:
                 out = data.get("output", [])
                 if out and out[0].get("content"):
-                    # content might contain output_text blocks
                     for block in out[0]["content"]:
-                        if block.get("type") in ("output_text", "text") and block.get("text"):
+                        # response blocks can be output_text
+                        if block.get("type") == "output_text" and block.get("text"):
                             text = (block.get("text") or "").strip()
                             break
             except Exception:
@@ -408,12 +392,10 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
         if not text:
             return None, raw
 
-        # strict JSON parse
         try:
             j = json.loads(text)
             return j, text
         except json.JSONDecodeError:
-            # extract first json object
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -440,6 +422,7 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
     tf = (j.get("timeframe") or "N/A").upper().strip()
     bias = (j.get("bias") or "Sideways").strip()
     conf = int(float(j.get("confidence") or 0))
+    conf = max(0, min(100, conf))
 
     def num_or_none(x):
         if x is None:
@@ -454,20 +437,14 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
     tp1 = num_or_none(j.get("tp1"))
     tp2 = num_or_none(j.get("tp2"))
     tp3 = num_or_none(j.get("tp3"))
-    note = (j.get("note") or "").strip()
+    note = (j.get("note") or "").strip()[:120]
 
-    # clamp confidence
-    conf = max(0, min(100, conf))
-
-    # If below threshold -> WAIT
     if action in ("BUY", "SELL") and conf < threshold:
         action = "WAIT"
 
-    # WAIT must not contain levels
     if action == "WAIT":
         entry = sl = tp1 = tp2 = tp3 = None
 
-    # BUY/SELL must contain all levels or switch to WAIT
     if action in ("BUY", "SELL"):
         if any(v is None for v in (entry, sl, tp1, tp2, tp3)):
             action = "WAIT"
@@ -484,7 +461,7 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "note": note[:120] if note else "",
+        "note": note,
     }
 
 
@@ -576,48 +553,59 @@ async def setplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid arguments.")
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+async def _download_bytes_from_message(update: Update) -> Optional[bytes]:
+    # PHOTO
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        f = await photo.get_file()
+        b = await f.download_as_bytearray()
+        return bytes(b)
 
-    # Determine access
+    # DOCUMENT image (Send as file)
+    doc = update.message.document
+    if doc and doc.mime_type and doc.mime_type.startswith("image/"):
+        f = await doc.get_file()
+        b = await f.download_as_bytearray()
+        return bytes(b)
+
+    return None
+
+
+async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     plan = user_plan(uid)
     paid = is_active(uid) and has_access(plan)
 
-    # Free trial gating
     if not paid:
         rem = free_remaining(uid)
         if rem <= 0:
-            await update.message.reply_text(
-                "🔒 Free trial finished (5/5).\n\nTo continue, subscribe:\n/plans"
-            )
+            await update.message.reply_text("🔒 Free trial finished (5/5).\n\nTo continue, subscribe:\n/plans")
             return
-        # allow analysis for trial
         plan = "FREE_TRIAL"
+
+    image_bytes = await _download_bytes_from_message(update)
+    if not image_bytes:
+        await update.message.reply_text("❌ Please send an image chart (photo or image file).")
+        return
 
     await update.message.reply_text("📸 Received. Analyzing...")
 
     try:
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        image_bytes = await file.download_as_bytearray()
-
-        # Run blocking call in a thread
-        j, raw = await asyncio.to_thread(call_openai_vision_blocking, bytes(image_bytes), plan)
+        j, raw = await asyncio.to_thread(call_openai_vision_blocking, image_bytes, plan)
 
         if not j:
-            logging.error(f"OpenAI error: {raw[:800]}")
-            await update.message.reply_text("❌ Analysis failed. Please send a clearer chart (zoom candles) and try again.")
+            logging.error(f"OpenAI raw/error: {raw[:1200]}")
+            await update.message.reply_text("❌ Analysis failed. Try again with a clearer chart screenshot (zoom candles).")
             return
 
         res = sanitize_result(j, plan)
         msg = fmt_signal(res, plan, trial_remaining=free_remaining(uid) if plan == "FREE_TRIAL" else None)
         await update.message.reply_text(msg)
 
-        # Count only if success & trial
         if plan == "FREE_TRIAL":
             inc_free_used(uid)
             await update.message.reply_text(
-                f"🧪 Free Trial: {free_remaining(uid)}/{FREE_TRIAL_LIMIT} remaining.\nUpgrade anytime: /plans"
+                f"🧪 Free Trial: {free_remaining(uid)}/{FREE_TRIAL_LIMIT} remaining.\nUpgrade: /plans"
             )
 
     except Exception as e:
@@ -642,12 +630,12 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
 
-    # Admin
     app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("setplan", setplan_cmd))
 
-    # Photos
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Photos + image documents
+    app.add_handler(MessageHandler(filters.PHOTO, analyze_image))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, analyze_image))
 
     app.run_polling(drop_pending_updates=True)
 
