@@ -18,15 +18,16 @@ from telegram.ext import (
 
 from openai import OpenAI
 
+
 # ================== ENV ==================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# Admin is optional at first run (to allow /myid to work even before setting it)
+# Admin optional at first run
 ADMIN_USER_ID_RAW = os.environ.get("ADMIN_USER_ID", "").strip()
 ADMIN_ID = int(ADMIN_USER_ID_RAW) if ADMIN_USER_ID_RAW.isdigit() else None
 
-# VIP DB path (use Render Persistent Disk if you want persistence across deploys)
+# VIP DB path
 DB_PATH = os.environ.get("VIP_DB_PATH", "vip.db")
 
 # OpenAI client
@@ -149,9 +150,11 @@ def _fmt_tips(tips: Any, lang: str) -> str:
     if not tips:
         return ""
     title = "🧩 نصائح:" if lang == "ar" else "🧩 Tips:"
-    bullets = "\n".join([f"• {t}" for t in tips[:3]])
+    bullets = "\n".join([f"• {t}" for t in tips[:5]])
     return f"{title}\n{bullets}\n"
 
+
+# ================== Message Formatter (Arabic + English) ==================
 def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
     ar_action = _icon_action(ar.get("action"))
     en_action = _icon_action(en.get("action"))
@@ -168,11 +171,29 @@ def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
     ar_prob = _fmt_prob(ar.get("probability"), "غير واضح")
     en_prob = _fmt_prob(en.get("probability"), "Not clear")
 
+    ar_trend = _fmt(ar.get("trend"), "غير واضح")
+    en_trend = _fmt(en.get("trend"), "Not clear")
+
+    ar_ema20 = _fmt(ar.get("ema20"), "غير واضح")
+    en_ema20 = _fmt(en.get("ema20"), "Not clear")
+
+    ar_ema50 = _fmt(ar.get("ema50"), "غير واضح")
+    en_ema50 = _fmt(en.get("ema50"), "Not clear")
+
+    ar_candle = _fmt(ar.get("candle_signal"), "غير واضح")
+    en_candle = _fmt(en.get("candle_signal"), "Not clear")
+
     ar_pattern = _fmt(ar.get("pattern_name"), "غير واضح")
     en_pattern = _fmt(en.get("pattern_name"), "Not clear")
 
     ar_bias = _fmt(ar.get("pattern_bias"), "غير واضح")
     en_bias = _fmt(en.get("pattern_bias"), "Not clear")
+
+    ar_rsi = _fmt(ar.get("rsi"), "غير موجود/غير واضح")
+    en_rsi = _fmt(en.get("rsi"), "Not shown/Not clear")
+
+    ar_stoch = _fmt(ar.get("stoch_rsi"), "غير موجود/غير واضح")
+    en_stoch = _fmt(en.get("stoch_rsi"), "Not shown/Not clear")
 
     ar_key = _fmt(ar.get("key_level"), "غير واضح")
     en_key = _fmt(en.get("key_level"), "Not clear")
@@ -213,8 +234,12 @@ def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
         "╰──────────────╯\n\n"
         f"{ar_action}\n"
         f"📌 الزوج: {ar_symbol}   ⏱️ {ar_tf}\n"
+        f"📈 الاتجاه: {ar_trend}\n"
+        f"📐 EMA20: {ar_ema20}   |   EMA50: {ar_ema50}\n"
+        f"🕯️ إشارة الشموع: {ar_candle}\n"
         f"⭐ الثقة: {ar_conf}   📊 الاحتمال: {ar_prob}%\n"
         f"🧩 النموذج: {ar_pattern} ({ar_bias})\n"
+        f"📟 RSI: {ar_rsi}   |   Stoch RSI: {ar_stoch}\n"
         f"🎯 مستوى مهم: {ar_key}\n"
     )
 
@@ -237,8 +262,12 @@ def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
     msg += (
         f"{en_action}\n"
         f"📌 Pair: {en_symbol}   ⏱️ {en_tf}\n"
+        f"📈 Trend: {en_trend}\n"
+        f"📐 EMA20: {en_ema20}   |   EMA50: {en_ema50}\n"
+        f"🕯️ Candle signal: {en_candle}\n"
         f"⭐ Confidence: {en_conf}   📊 Probability: {en_prob}%\n"
         f"🧩 Pattern: {en_pattern} ({en_bias})\n"
+        f"📟 RSI: {en_rsi}   |   Stoch RSI: {en_stoch}\n"
         f"🎯 Key level: {en_key}\n"
     )
 
@@ -262,19 +291,14 @@ def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
 
 # ================== Robust JSON extraction ==================
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Try to parse JSON. If it fails, try to locate first {...} block.
-    """
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty response")
-    # direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # find first JSON object by braces (best-effort)
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -284,35 +308,63 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("No JSON object found")
 
 
-# ================== AI Prompts ==================
+# ================== AI PROMPTS (EMA + Candles + Works without RSI/Stoch) ==================
 IMAGE_PROMPT = """
-You are a conservative trading analyst focused on accuracy.
+You are a conservative trading analyst focused on accuracy (Arabic + English JSON).
 
-Rules:
-- Do NOT mention a chart pattern unless it is clearly visible. If unclear, set pattern_name="Not clear/غير واضح".
-- Even if pattern is unclear, you MUST still provide practical tips (confirmation, key levels, what to wait for).
-- Provide a PROBABILITY estimate as a subjective confidence score (0–100). It is NOT guaranteed.
-- If prices/levels are not readable, do NOT invent numbers: use "Not clear/غير واضح" and set action="WAIT".
-- Use RSI + Stoch RSI as confirmation/timing, not the only reason.
-- Prefer WAIT when confirmation is missing.
-- Keep reason max 2 lines.
+BUY/SELL RULE:
+- If probability >= 65 AND you have at least 2 confirmations, choose BUY or SELL.
+- Confirmations examples:
+  1) trend + key level reaction (break/rejection/retest),
+  2) candle confirmation (engulfing / pin bar / doji / inside bar),
+  3) EMA20/EMA50 alignment (if visible),
+  4) RSI/Stoch timing (if visible).
+- If confirmations are weak OR levels are unreadable -> action MUST be WAIT.
 
-Output VALID JSON ONLY:
+IMPORTANT:
+- The chart might show ONLY candles (no RSI/Stoch). In that case:
+  - still analyze using price action + structure + key levels + EMAs/candles if visible,
+  - set rsi="Not shown/غير موجود" and stoch_rsi="Not shown/غير موجود" (do NOT force WAIT just because indicators are missing).
+
+Pattern Rule:
+- Do NOT mention a chart pattern unless it is clearly visible. If unclear: pattern_name="Not clear/غير واضح".
+
+Numbers:
+- Do NOT invent exact prices. If Entry/SL/TP not readable -> set them to "Not clear/غير واضح".
+- You may still output BUY/SELL without exact numbers ONLY if you can clearly describe the confirmation and key level direction;
+  however, prefer WAIT when numbers are unreadable.
+
+EMA:
+- If EMA20/EMA50 are visible, fill ema20/ema50 fields with "above price / below price / crossing / not clear" (or Arabic equivalents).
+
+Candles:
+- Identify the clearest candle signal if present: "Bullish engulfing", "Bearish engulfing", "Pin bar", "Doji", "Inside bar", or "Not clear".
+- If no clear candle signal: set candle_signal="Not clear/غير واضح".
+
+Keep reason max 2 lines.
+
+Output VALID JSON ONLY in this schema:
 {
   "ar": {
-    "symbol":"...", "timeframe":"...", "action":"BUY/SELL/WAIT",
+    "symbol":"...", "timeframe":"...", "trend":"Bullish/Bearish/Sideways",
+    "ema20":"...", "ema50":"...", "candle_signal":"...",
+    "action":"BUY/SELL/WAIT",
     "probability":0, "confidence":"High/Medium/Low",
     "pattern_name":"...", "pattern_bias":"Bullish/Bearish/Neutral",
+    "rsi":"...", "stoch_rsi":"...",
     "key_level":"...", "entry":"...", "sl":"...", "tp1":"...", "tp2":"...",
-    "reason":"...", "wait_reason":"...", "tips":["...","...","..."],
+    "reason":"...", "wait_reason":"...", "tips":["...","...","...","...","..."],
     "warning":"⚠️ تنبيه: التحليل تعليمي والنسبة تقديرية وليست ضمان. المخاطرة 1–2% فقط."
   },
   "en": {
-    "symbol":"...", "timeframe":"...", "action":"BUY/SELL/WAIT",
+    "symbol":"...", "timeframe":"...", "trend":"Bullish/Bearish/Sideways",
+    "ema20":"...", "ema50":"...", "candle_signal":"...",
+    "action":"BUY/SELL/WAIT",
     "probability":0, "confidence":"High/Medium/Low",
     "pattern_name":"...", "pattern_bias":"Bullish/Bearish/Neutral",
+    "rsi":"...", "stoch_rsi":"...",
     "key_level":"...", "entry":"...", "sl":"...", "tp1":"...", "tp2":"...",
-    "reason":"...", "wait_reason":"...", "tips":["...","...","..."],
+    "reason":"...", "wait_reason":"...", "tips":["...","...","...","...","..."],
     "warning":"⚠️ Warning: Educational only. Probability is an estimate (not guaranteed). Risk max 1–2%."
   }
 }
@@ -320,25 +372,43 @@ Output VALID JSON ONLY:
 
 def _fallback_analysis(symbol="XAUUSD", tf="M5") -> str:
     ar = {
-        "symbol": symbol, "timeframe": tf, "action": "WAIT",
+        "symbol": symbol, "timeframe": tf, "trend": "غير واضح",
+        "ema20": "غير واضح", "ema50": "غير واضح", "candle_signal": "غير واضح",
+        "action": "WAIT",
         "probability": 50, "confidence": "Low",
         "pattern_name": "غير واضح", "pattern_bias": "غير واضح",
+        "rsi": "غير موجود/غير واضح", "stoch_rsi": "غير موجود/غير واضح",
         "key_level": "غير واضح",
         "entry": "غير واضح", "sl": "غير واضح", "tp1": "غير واضح", "tp2": "غير واضح",
         "reason": "الإشارة غير واضحة أو تعذر قراءة البيانات.",
-        "wait_reason": "عدم وضوح نموذج/تأكيدات كافية.",
-        "tips": ["انتظر كسر/ارتداد واضح", "تجنب السوق المتذبذب", "التزم بإدارة مخاطر 1–2%"],
+        "wait_reason": "عدم وضوح مستويات/تأكيدات كافية.",
+        "tips": [
+            "انتظر كسر/ارتداد واضح عند مستوى مهم",
+            "أكد الدخول بإغلاق شمعة",
+            "راقب EMA20/EMA50 لو متاحة",
+            "تجنب السوق المتذبذب",
+            "التزم بإدارة مخاطر 1–2%"
+        ],
         "warning": "⚠️ تنبيه: التحليل تعليمي والنسبة تقديرية وليست ضمان. المخاطرة 1–2% فقط."
     }
     en = {
-        "symbol": symbol, "timeframe": tf, "action": "WAIT",
+        "symbol": symbol, "timeframe": tf, "trend": "Not clear",
+        "ema20": "Not clear", "ema50": "Not clear", "candle_signal": "Not clear",
+        "action": "WAIT",
         "probability": 50, "confidence": "Low",
         "pattern_name": "Not clear", "pattern_bias": "Not clear",
+        "rsi": "Not shown/Not clear", "stoch_rsi": "Not shown/Not clear",
         "key_level": "Not clear",
         "entry": "Not clear", "sl": "Not clear", "tp1": "Not clear", "tp2": "Not clear",
         "reason": "Signal unclear or data could not be parsed.",
-        "wait_reason": "No clear confirmations/pattern.",
-        "tips": ["Wait for clear breakout/rejection", "Avoid choppy ranges", "Risk max 1–2% per trade"],
+        "wait_reason": "No clear confirmations/levels.",
+        "tips": [
+            "Wait for clear breakout/rejection at a key level",
+            "Confirm with candle close",
+            "Watch EMA20/EMA50 if visible",
+            "Avoid choppy ranges",
+            "Risk max 1–2% per trade"
+        ],
         "warning": "⚠️ Warning: Educational only. Probability is an estimate (not guaranteed). Risk max 1–2%."
     }
     return format_message(ar, en)
@@ -346,7 +416,6 @@ def _fallback_analysis(symbol="XAUUSD", tf="M5") -> str:
 def analyze_with_ai(image_bytes: bytes) -> str:
     b64 = base64.b64encode(bytes(image_bytes)).decode("utf-8")
 
-    # Retry once if response is empty/bad json
     last_err = None
     for attempt in range(2):
         try:
@@ -369,7 +438,6 @@ def analyze_with_ai(image_bytes: bytes) -> str:
             last_err = e
             logger.warning(f"AI analyze attempt {attempt+1}/2 failed: {e}")
 
-    # fallback
     logger.warning(f"AI analyze fallback used. last_err={last_err}")
     return _fallback_analysis()
 
@@ -381,13 +449,18 @@ def generate_signal_with_ai(symbol: str, timeframe: str) -> str:
 You are a conservative scalping/day-trading signal provider.
 Create a signal for Symbol={symbol}, Timeframe={timeframe}.
 
-Rules:
-- Output MUST be VALID JSON only in the SAME schema as the image prompt.
-- Use BUY/SELL/WAIT. If not confident -> WAIT.
-- Provide probability 0-100 as an estimate (not guaranteed).
-- Do NOT mention a chart pattern unless clearly justified; otherwise pattern_name="Not clear/غير واضح".
-- Always give practical tips (even if WAIT).
-- Keep reason max 2 lines.
+BUY/SELL RULE:
+- If probability >= 65 AND you have at least 2 confirmations, choose BUY or SELL.
+- Confirmations can use: trend + key level reaction + candle signal + EMA alignment + RSI/Stoch if known.
+- If not confident -> WAIT.
+
+IMPORTANT:
+- You might not have RSI/Stoch here. If unknown, set them to "Not shown/غير موجود".
+- Do NOT invent exact prices. If you can't justify Entry/SL/TP -> keep them "Not clear/غير واضح".
+- Pattern only if very clear.
+
+Keep reason max 2 lines.
+Output VALID JSON ONLY (same schema as IMAGE_PROMPT).
 """
     last_err = None
     for attempt in range(2):
@@ -410,16 +483,16 @@ Rules:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "✅ البوت شغال\n"
-        "📸 أرسل صورة الشارت للتحليل\n"
-        "🔒 /signal (VIP فقط)\n"
+        "📸 أرسل صورة الشارت للتحليل (Price Action + EMA + Candles + Pattern + RSI/Stoch إذا موجود)\n"
+        "🔒 /signal XAUUSD M5 (VIP)\n"
         "ℹ️ لمعرفة رقمك: /myid"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "📌 الاستخدام:\n"
-        "- أرسل صورة شارت واضحة للتحليل\n"
-        "- /signal XAUUSD M5 يعطي إشارة (VIP)\n"
+        "- أرسل صورة شارت واضحة للتحليل (شموع فقط أو مع مؤشرات)\n"
+        "- /signal XAUUSD M5 يعطي إشارة VIP (BUY/SELL/WAIT)\n"
         "- /myid يطلع رقمك + حالة VIP\n\n"
         "Admin (بعد ما تضيف ADMIN_USER_ID):\n"
         "/vipadd <user_id> <days>\n"
@@ -469,9 +542,8 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = generate_signal_with_ai(symbol, timeframe)
         await update.effective_message.reply_text(msg)
-    except Exception as e:
+    except Exception:
         logger.exception("SIGNAL_ERROR")
-        # even here, fallback message
         await update.effective_message.reply_text(_fallback_analysis(symbol=symbol.upper(), tf=timeframe.upper()))
 
 # ----- Admin VIP management -----
@@ -567,9 +639,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         analysis = analyze_with_ai(image_bytes)
         await msg.reply_text(analysis)
 
-    except Exception as e:
+    except Exception:
         logger.exception("PHOTO_HANDLER_ERROR")
-        # last-resort fallback (always reply)
         await msg.reply_text(_fallback_analysis())
 
 
@@ -592,22 +663,17 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commands FIRST
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
 
-    # Admin VIP commands
     app.add_handler(CommandHandler("vipadd", vipadd_cmd))
     app.add_handler(CommandHandler("vipremove", vipremove_cmd))
     app.add_handler(CommandHandler("vipcheck", vipcheck_cmd))
     app.add_handler(CommandHandler("viplist", viplist_cmd))
 
-    # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    # Keep chat clean (commands still work)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ignore_text))
 
     logger.info("🤖 Trading AI Bot is running...")
