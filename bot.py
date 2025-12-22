@@ -1,4 +1,8 @@
 import os
+# ================= LANGUAGE SETTINGS =================
+USER_LANG = {}        # user_id -> "AR" | "EN" | "BOTH"
+DEFAULT_LANG = "AR"   # خلّه عربي افتراضي
+# ====================================================
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -77,7 +81,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 أرسل صورة الشارت (أي زوج / أي فريم)\n"
         "وسيتم التحليل + التوصية حسب الفريم تلقائياً."
     )
+# ================= LANGUAGE COMMAND =================
+USER_LANG = {}
+DEFAULT_LANG = "AR"
 
+async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not context.args:
+        current = USER_LANG.get(user_id, DEFAULT_LANG)
+        await update.message.reply_text(
+            f"🌐 Language: {current}\n\n"
+            "اختر اللغة:\n"
+            "/lang ar  🇸🇦 عربي\n"
+            "/lang en  🇬🇧 English\n"
+            "/lang both 🌍 عربي + English"
+        )
+        return
+
+    arg = context.args[0].lower()
+    if arg in ["ar", "arabic"]:
+        USER_LANG[user_id] = "AR"
+    elif arg in ["en", "english"]:
+        USER_LANG[user_id] = "EN"
+    elif arg in ["both", "mix"]:
+        USER_LANG[user_id] = "BOTH"
+    else:
+        await update.message.reply_text("❌ استخدم: /lang ar | /lang en | /lang both")
+        return
+
+    await update.message.reply_text(f"✅ تم ضبط اللغة: {USER_LANG[user_id]}")
+# ===================================================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📌 طريقة الاستخدام:\n"
@@ -85,22 +119,26 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- يدعم: RSI / Stoch RSI / Price Action / Patterns\n"
         "- يعمل على جميع العملات والفريمات"
     )
-
+    
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
         image_bytes = await file.download_as_bytearray()
 
+        user_id = update.effective_user.id
+        lang_mode = USER_LANG.get(user_id, DEFAULT_LANG)
+
         await update.message.reply_text("⏳ يتم تحليل الشارت...")
 
-        analysis = await analyze_chart(bytes(image_bytes))
+        analysis = await analyze_chart(image_bytes, lang_mode)
         await update.message.reply_text(analysis)
 
     except Exception as e:
         logging.error(e)
-        await update.message.reply_text("❌ حدث خطأ أثناء التحليل.")
+        await update.message.reply_text("❌ حدث خطأ أثناء تحليل الصورة")
 
+application.add_handler(CommandHandler("lang", lang_cmd))
 # =======================
 # MAIN
 # =======================
