@@ -1,560 +1,542 @@
-# =========================================
-# Trading AI Telegram Bot – Commercial Build
-# English first, Arabic below
-# Lite (free) + VIP Auto + Gold Mode (VIP)
-# Plans: 49$ / 99$ / 119$
-# Photo analysis + /signal command
-# =========================================
-
 import os
-import re
 import json
-import base64
-import html
+import time
 import sqlite3
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any, Tuple
 
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-from openai import OpenAI
-
-# ================== CONFIG ==================
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-ADMIN_RAW = (os.getenv("ADMIN_USER_ID") or "").strip()
-ADMIN_ID = int(ADMIN_RAW) if ADMIN_RAW.isdigit() else None
-DB_PATH = (os.getenv("VIP_DB_PATH") or "vip.db").strip()
-
-# Prices (marketing)
-PRICE_AUTO = "49$"
-PRICE_GOLD = "99$"
-PRICE_BUNDLE = "119$"
-
-# Thresholds
-VIP_AUTO_MIN_PROB = 65
-GOLD_MODE_MIN_PROB = 70
-GOLD_MODE_SYMBOLS = {"XAUUSD", "GOLD"}
-GOLD_MODE_TFS = {"M5", "M15"}
-
-# Model
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
 )
-log = logging.getLogger("TradingAI")
+
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
+
+# Optional tuning
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # you can change later
+VIP_MIN_CONFIDENCE_ALL = int(os.getenv("VIP_MIN_CONF_ALL", "65"))  # ALL mode threshold
+VIP_MIN_CONFIDENCE_GOLD = int(os.getenv("VIP_MIN_CONF_GOLD", "70")) # GOLD mode threshold
+
+# Modes:
+# - "ALL": all symbols/timeframes (recommended for VIP)
+# - "GOLD": XAUUSD only + M5/M15 stricter (higher win-rate marketing)
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "ALL").strip().upper()
+
+DB_PATH = os.getenv("DB_PATH", "vip.db")
+
+logging.basicConfig(level=logging.INFO)
 
 
-# ================== DB (VIP) ==================
-def _db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+# =========================
+# DB (VIP)
+# =========================
+def db_conn():
+    return sqlite3.connect(DB_PATH)
 
-def db_init():
-    con = _db()
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vip_users (
+def init_db():
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS vip_users(
             user_id INTEGER PRIMARY KEY,
-            expires_at_utc TEXT NOT NULL
+            expires_at INTEGER NOT NULL
         )
-    """)
-    con.commit()
-    con.close()
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        )
+        """)
+        con.commit()
 
-def set_vip(user_id: int, days: int) -> datetime:
-    expires = datetime.now(timezone.utc) + timedelta(days=days)
-    con = _db()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO vip_users(user_id, expires_at_utc) VALUES(?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET expires_at_utc=excluded.expires_at_utc",
-        (user_id, expires.isoformat()),
-    )
-    con.commit()
-    con.close()
-    return expires
+def set_setting(k: str, v: str):
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        con.commit()
+
+def get_setting(k: str, default: str = "") -> str:
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT v FROM settings WHERE k=?", (k,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+def add_vip(user_id: int, days: int):
+    expires_at = int(time.time()) + int(days) * 86400
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("INSERT INTO vip_users(user_id, expires_at) VALUES(?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at",
+                    (user_id, expires_at))
+        con.commit()
 
 def remove_vip(user_id: int):
-    con = _db()
-    cur = con.cursor()
-    cur.execute("DELETE FROM vip_users WHERE user_id=?", (user_id,))
-    con.commit()
-    con.close()
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("DELETE FROM vip_users WHERE user_id=?", (user_id,))
+        con.commit()
 
-def get_vip_expiry(user_id: int) -> Optional[datetime]:
-    con = _db()
-    cur = con.cursor()
-    cur.execute("SELECT expires_at_utc FROM vip_users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    try:
-        return datetime.fromisoformat(row[0]).astimezone(timezone.utc)
-    except Exception:
-        return None
+def vip_expires_at(user_id: int) -> Optional[int]:
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT expires_at FROM vip_users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        return int(row[0]) if row else None
 
 def is_vip(user_id: int) -> bool:
-    exp = get_vip_expiry(user_id)
-    return bool(exp and datetime.now(timezone.utc) < exp)
+    exp = vip_expires_at(user_id)
+    return bool(exp and exp > int(time.time()))
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID is not None and user_id == ADMIN_ID
-
-
-# ================== UTIL ==================
-def clean(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
-
-def clip(s: str, n: int = 160) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else (s[: n - 1].rstrip() + "…")
-
-def act_icon(a: str) -> str:
-    a = (a or "").upper().strip()
-    if a == "BUY":
-        return "🟢 BUY"
-    if a == "SELL":
-        return "🔴 SELL"
-    return "🟡 WAIT"
-
-def g(d: Dict[str, Any], k: str, fb: str) -> str:
-    v = d.get(k)
-    v = "" if v is None else str(v).strip()
-    return v if v else fb
-
-def prob_fmt(d: Dict[str, Any], fb: str = "--") -> str:
-    try:
-        p = int(float(d.get("probability", 0)))
-        p = max(0, min(100, p))
-        return f"{p}%"
-    except Exception:
-        return fb
-
-async def send_pre(msg, text: str):
-    safe = html.escape(text or "")
-    await msg.reply_text(f"<pre>{safe}</pre>", parse_mode="HTML")
+def vip_days_left(user_id: int) -> int:
+    exp = vip_expires_at(user_id) or 0
+    left = exp - int(time.time())
+    return max(0, left // 86400)
 
 
-# ================== OUTPUT FORMAT ==================
-def format_signal(en: Dict[str, Any], ar: Dict[str, Any], *, include_marketing: bool) -> str:
-    # English first
-    en_action = act_icon(en.get("action"))
-    en_symbol = g(en, "symbol", "Not clear")
-    en_tf = g(en, "timeframe", "?")
-    en_trend = g(en, "trend", "Not clear")
-    en_conf = g(en, "confidence", "?")
-    en_prob = prob_fmt(en, "--")
+# =========================
+# UI / MARKETING
+# =========================
+PLANS_TEXT = """\
+💎 Trading AI – Plans
 
-    en_entry = g(en, "entry", "Not clear")
-    en_sl = g(en, "sl", "Not clear")
-    en_tp1 = g(en, "tp1", "Not clear")
-    en_tp2 = g(en, "tp2", "Not clear")
-    en_tp3 = g(en, "tp3", "Not clear")
-    en_wait = clip(g(en, "wait_reason", "Not clear"), 140)
+$49  - GOLD VIP (XAUUSD, M5/M15)
+$99  - VIP ALL (All pairs & timeframes)
+$119 - VIP PRO (All pairs & timeframes + priority updates)
 
-    # Arabic
-    ar_action = act_icon(ar.get("action"))
-    ar_symbol = g(ar, "symbol", "غير واضح")
-    ar_tf = g(ar, "timeframe", "؟")
-    ar_trend = g(ar, "trend", "غير واضح")
-    ar_conf = g(ar, "confidence", "؟")
-    ar_prob = prob_fmt(ar, "--")
+To activate VIP, contact admin.
+"""
 
-    ar_entry = g(ar, "entry", "غير واضح")
-    ar_sl = g(ar, "sl", "غير واضح")
-    ar_tp1 = g(ar, "tp1", "غير واضح")
-    ar_tp2 = g(ar, "tp2", "غير واضح")
-    ar_tp3 = g(ar, "tp3", "غير واضح")
-    ar_wait = clip(g(ar, "wait_reason", "غير واضح"), 140)
-
-    out = []
-    out.append("🤖 Trading AI")
-    out.append(f"{en_action} | {en_symbol} {en_tf} | {en_trend} | {en_conf} {en_prob}")
-
-    if (en.get("action") or "").upper().strip() == "WAIT":
-        out.append(f"⏳ Reason: {en_wait}")
-    else:
-        out.append(f"🎯 Entry: {en_entry}")
-        out.append(f"🛑 SL: {en_sl}")
-        out.append(f"✅ TP1: {en_tp1} | TP2: {en_tp2} | TP3: {en_tp3}")
-
-    out.append("⚠️ Warning: Educational only | Risk 1–2%")
-
-    if include_marketing:
-        out.append(f"🔒 Upgrade to VIP for higher accuracy")
-        out.append(f"💎 Plans from {PRICE_AUTO}  |  /plans")
-
-    out.append("────────────────────")
-
-    out.append(f"{ar_action} | {ar_symbol} {ar_tf} | {ar_trend} | {ar_conf} {ar_prob}")
-    if (ar.get("action") or "").upper().strip() == "WAIT":
-        out.append(f"⏳ السبب: {ar_wait}")
-    else:
-        out.append(f"🎯 دخول: {ar_entry}")
-        out.append(f"🛑 SL: {ar_sl}")
-        out.append(f"✅ TP1: {ar_tp1} | TP2: {ar_tp2} | TP3: {ar_tp3}")
-    out.append("⚠️ تنبيه: تعليمي فقط | المخاطرة 1–2%")
-
-    if include_marketing:
-        out.append("🔒 للترقية إلى VIP لدقة أعلى")
-        out.append(f"💎 الخطط تبدأ من {PRICE_AUTO}  |  /plans")
-
-    return clean("\n".join(out))
-
-
-# ================== AI (Robust JSON) ==================
-def extract_json(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("Empty model output")
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Try to find a JSON object within text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(text[start:end + 1])
-
-    raise ValueError("No JSON found")
-
-def is_gold_mode(symbol: str, timeframe: str) -> bool:
-    s = (symbol or "").upper().strip()
-    tf = (timeframe or "").upper().strip()
-    return (s in GOLD_MODE_SYMBOLS) and (tf in GOLD_MODE_TFS)
-
-def build_prompt(mode: str, min_prob: int) -> str:
-    # mode: "lite" or "vip"
-    return f"""
-You are a trading signal generator. Output Arabic+English JSON ONLY.
-
-Mode: {mode}
-Minimum probability for BUY/SELL: {min_prob}
-
-Rules:
-- Decide BUY or SELL only if probability >= {min_prob} and trend direction is clear.
-- Otherwise WAIT.
-- NEVER invent exact prices. If Entry/SL/TP are not readable, set them to "Not clear" (English) and "غير واضح" (Arabic).
-- Keep outputs short and clean.
-- Provide TP1, TP2, TP3 when possible.
-- If indicators (RSI/Stoch) are not visible, continue using price action / trend / structure. Do NOT force WAIT just because indicators are missing.
-- WAIT must include a short wait_reason.
-
-Output schema (VALID JSON ONLY):
-{{
-  "en": {{
-    "symbol":"...", "timeframe":"...", "trend":"Bullish/Bearish/Sideways",
-    "action":"BUY/SELL/WAIT",
-    "probability":0, "confidence":"High/Medium/Low",
-    "entry":"...", "sl":"...", "tp1":"...", "tp2":"...", "tp3":"...",
-    "wait_reason":"..."
-  }},
-  "ar": {{
-    "symbol":"...", "timeframe":"...", "trend":"صاعد/هابط/تذبذب",
-    "action":"BUY/SELL/WAIT",
-    "probability":0, "confidence":"High/Medium/Low",
-    "entry":"...", "sl":"...", "tp1":"...", "tp2":"...", "tp3":"...",
-    "wait_reason":"..."
-  }}
-}}
-""".strip()
-
-def analyze_image(image_bytes: bytes, *, mode: str, min_prob: int) -> str:
-    b64 = base64.b64encode(bytes(image_bytes)).decode("utf-8")
-    prompt = build_prompt(mode=mode, min_prob=min_prob)
-
-    last_err = None
-    for attempt in range(2):
-        try:
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                input=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
-                    ],
-                }],
-            )
-            data = extract_json(resp.output_text)
-            en = data.get("en", {}) if isinstance(data, dict) else {}
-            ar = data.get("ar", {}) if isinstance(data, dict) else {}
-
-            # Ensure keys exist
-            for k in ["symbol", "timeframe", "trend", "action", "probability", "confidence", "entry", "sl", "tp1", "tp2", "tp3", "wait_reason"]:
-                en.setdefault(k, "Not clear" if k not in ("probability",) else 0)
-                ar.setdefault(k, "غير واضح" if k not in ("probability",) else 0)
-
-            include_marketing = (mode == "lite")
-            return format_signal(en, ar, include_marketing=include_marketing)
-
-        except Exception as e:
-            last_err = e
-            log.warning(f"analyze_image attempt {attempt+1}/2 failed: {e}")
-
-    # Fallback
-    log.warning(f"analyze_image fallback used. last_err={last_err}")
-    en_fb = {
-        "symbol": "Not clear", "timeframe": "?", "trend": "Not clear",
-        "action": "WAIT", "probability": 55, "confidence": "Low",
-        "entry": "Not clear", "sl": "Not clear", "tp1": "Not clear", "tp2": "Not clear", "tp3": "Not clear",
-        "wait_reason": "Image unclear. Please resend a clearer chart."
-    }
-    ar_fb = {
-        "symbol": "غير واضح", "timeframe": "؟", "trend": "غير واضح",
-        "action": "WAIT", "probability": 55, "confidence": "Low",
-        "entry": "غير واضح", "sl": "غير واضح", "tp1": "غير واضح", "tp2": "غير واضح", "tp3": "غير واضح",
-        "wait_reason": "الصورة غير واضحة. أعد إرسال الشارت بشكل أوضح."
-    }
-    return format_signal(en_fb, ar_fb, include_marketing=(mode == "lite"))
-
-def generate_signal_text(symbol: str, timeframe: str, *, min_prob: int, gold_mode: bool) -> str:
-    symbol = (symbol or "XAUUSD").upper().strip()
-    timeframe = (timeframe or "M5").upper().strip()
-    mode_name = "Gold Mode" if gold_mode else "VIP Auto"
-
-    prompt = f"""
-You are a trading signal generator. Output Arabic+English JSON ONLY.
-
-Mode: {mode_name}
-Symbol: {symbol}
-Timeframe: {timeframe}
-Minimum probability for BUY/SELL: {min_prob}
-
-Rules:
-- You do NOT have live price feed. Do NOT invent exact prices.
-- If you can't provide Entry/SL/TP clearly, set them to "Not clear" / "غير واضح".
-- Decide BUY/SELL only if probability >= {min_prob} and trend is clear, else WAIT.
-- Output short wait_reason.
-- VALID JSON only.
-
-Schema:
-{{
-  "en": {{
-    "symbol":"{symbol}", "timeframe":"{timeframe}", "trend":"Bullish/Bearish/Sideways",
-    "action":"BUY/SELL/WAIT",
-    "probability":0, "confidence":"High/Medium/Low",
-    "entry":"...", "sl":"...", "tp1":"...", "tp2":"...", "tp3":"...",
-    "wait_reason":"..."
-  }},
-  "ar": {{
-    "symbol":"{symbol}", "timeframe":"{timeframe}", "trend":"صاعد/هابط/تذبذب",
-    "action":"BUY/SELL/WAIT",
-    "probability":0, "confidence":"High/Medium/Low",
-    "entry":"...", "sl":"...", "tp1":"...", "tp2":"...", "tp3":"...",
-    "wait_reason":"..."
-  }}
-}}
-""".strip()
-
-    last_err = None
-    for attempt in range(2):
-        try:
-            resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
-            data = extract_json(resp.output_text)
-            en = data.get("en", {}) if isinstance(data, dict) else {}
-            ar = data.get("ar", {}) if isinstance(data, dict) else {}
-
-            for k in ["symbol", "timeframe", "trend", "action", "probability", "confidence", "entry", "sl", "tp1", "tp2", "tp3", "wait_reason"]:
-                en.setdefault(k, "Not clear" if k not in ("probability",) else 0)
-                ar.setdefault(k, "غير واضح" if k not in ("probability",) else 0)
-
-            return format_signal(en, ar, include_marketing=False)
-        except Exception as e:
-            last_err = e
-            log.warning(f"generate_signal_text attempt {attempt+1}/2 failed: {e}")
-
-    log.warning(f"generate_signal_text fallback used. last_err={last_err}")
-    en_fb = {
-        "symbol": symbol, "timeframe": timeframe, "trend": "Not clear",
-        "action": "WAIT", "probability": 55, "confidence": "Low",
-        "entry": "Not clear", "sl": "Not clear", "tp1": "Not clear", "tp2": "Not clear", "tp3": "Not clear",
-        "wait_reason": "No chart/price feed. Send a screenshot for accurate levels."
-    }
-    ar_fb = {
-        "symbol": symbol, "timeframe": timeframe, "trend": "غير واضح",
-        "action": "WAIT", "probability": 55, "confidence": "Low",
-        "entry": "غير واضح", "sl": "غير واضح", "tp1": "غير واضح", "tp2": "غير واضح", "tp3": "غير واضح",
-        "wait_reason": "لا يوجد شارت/سعر مباشر. أرسل صورة للشارت لتحديد المستويات بدقة."
-    }
-    return format_signal(en_fb, ar_fb, include_marketing=False)
-
-
-# ================== MARKETING TEXT ==================
-def plans_text() -> str:
-    return clean(f"""
-💎 VIP Plans
-
-• VIP Auto: {PRICE_AUTO} / month
-  - All pairs & timeframes
-  - Smart filtering (min {VIP_AUTO_MIN_PROB}%)
-
-• Gold Mode: {PRICE_GOLD} / month
-  - XAUUSD only (M5/M15)
-  - Higher accuracy (min {GOLD_MODE_MIN_PROB}%)
-
-• Bundle: {PRICE_BUNDLE} / month ⭐
-  - VIP Auto + Gold Mode
-
-To activate: message admin with /myid
-""".strip())
-
-def vip_locked_text() -> str:
-    return clean(f"""
+FREE_TEXT = """\
 🔒 VIP Feature
+This bot provides VIP trading signals.
 
-💎 Plans:
-• VIP Auto: {PRICE_AUTO} / month
-• Gold Mode: {PRICE_GOLD} / month
-• Bundle: {PRICE_BUNDLE} / month ⭐
+Type /plans to see pricing.
+"""
 
-To activate: send /myid to admin.
-""".strip())
+HELP_TEXT = """\
+🤖 Trading AI Bot (EN)
+
+Commands:
+- /start
+- /plans
+- /status  (check your VIP status)
+- /mode gold | /mode all   (admin only)
+- /vipadd <user_id> <days> (admin only)
+- /vipremove <user_id>     (admin only)
+
+Usage:
+- Send a chart image (candles only is OK).
+The bot will return a clean signal:
+BUY/SELL/WAIT + Entry/SL/TP1/TP2/TP3 + Confidence.
+"""
 
 
-# ================== COMMANDS ==================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = clean(
-        "✅ Bot is running\n"
-        "📸 Send a chart image for analysis (Lite free)\n"
-        "🔒 VIP: /signal XAUUSD M5\n"
-        "💎 Plans: /plans\n"
-        "🆔 Your ID: /myid"
+# =========================
+# OUTPUT FORMAT (SHORT, CLEAN)
+# =========================
+def fmt_signal(res: Dict[str, Any]) -> str:
+    """
+    Expected keys:
+    action: BUY/SELL/WAIT
+    pair: e.g. XAUUSD
+    timeframe: e.g. M5
+    bias: Bullish/Bearish/Sideways
+    confidence: 0-100
+    entry, sl, tp1, tp2, tp3: floats (only if action != WAIT)
+    note: short string
+    """
+    action = (res.get("action") or "WAIT").upper()
+    pair = (res.get("pair") or "N/A").upper()
+    tf = (res.get("timeframe") or "N/A").upper()
+    bias = (res.get("bias") or "Neutral").title()
+    conf = int(res.get("confidence") or 0)
+    note = (res.get("note") or "").strip()
+
+    if action == "WAIT":
+        # Keep it short, no long essay
+        return f"""\
+🟡 WAIT | {pair} {tf} | {conf}%
+
+No clean confirmation.
+Wait for clearer price action.
+
+⚠️ Risk 1–2% | Educational only""".strip()
+
+    entry = res.get("entry")
+    sl = res.get("sl")
+    tp1 = res.get("tp1")
+    tp2 = res.get("tp2")
+    tp3 = res.get("tp3")
+
+    # Minimal note (1 line max)
+    if note:
+        note_line = f"\n🧠 Note: {note[:120]}"
+    else:
+        note_line = ""
+
+    return f"""\
+🟢 {action} | {pair} {tf} | {bias} | {conf}%
+
+🎯 Entry: {entry}
+🛑 SL: {sl}
+✅ TP1: {tp1}
+✅ TP2: {tp2}
+✅ TP3: {tp3}{note_line}
+
+⚠️ Risk 1–2% | Educational only""".strip()
+
+
+# =========================
+# MODE RULES (Reduce WAIT / Raise accuracy)
+# =========================
+def current_mode() -> str:
+    return get_setting("MODE", DEFAULT_MODE).upper() or "ALL"
+
+def mode_threshold() -> int:
+    m = current_mode()
+    if m == "GOLD":
+        return VIP_MIN_CONFIDENCE_GOLD
+    return VIP_MIN_CONFIDENCE_ALL
+
+def mode_constraints_prompt() -> str:
+    m = current_mode()
+    if m == "GOLD":
+        return (
+            "Mode is GOLD ONLY:\n"
+            "- Focus on XAUUSD (Gold) primarily.\n"
+            "- Prefer M5/M15.\n"
+            "- Be stricter; avoid signals unless clear.\n"
+        )
+    return (
+        "Mode is ALL:\n"
+        "- Any symbol/timeframe allowed.\n"
+        "- Still avoid low-quality signals.\n"
     )
-    await update.effective_message.reply_text(txt)
 
-async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_pre(update.effective_message, plans_text())
 
-async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    exp = get_vip_expiry(uid)
-    vip_status = "✅ VIP Active" if is_vip(uid) else "🔒 VIP Not active"
-    if exp and is_vip(uid):
-        exp_str = exp.strftime("%Y-%m-%d %H:%M UTC")
-        vip_status += f"\nExpires: {exp_str}"
+# =========================
+# OPENAI VISION CALL
+# =========================
+def call_openai_vision(image_bytes: bytes, extra_prompt: str = "") -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Returns (json_result_or_none, raw_text).
+    Uses OpenAI Responses API style via HTTP.
+    """
+    if not OPENAI_API_KEY:
+        return None, "Missing OPENAI_API_KEY"
 
-    admin_hint = ""
-    if ADMIN_ID is None:
-        admin_hint = "\n\n⚠️ ADMIN_USER_ID not set yet (admin commands disabled)."
-
-    await update.effective_message.reply_text(
-        f"🆔 Your Telegram ID: {uid}\n{vip_status}{admin_hint}"
+    # Strong JSON-only contract to avoid JSONDecodeError
+    system = (
+        "You are a professional trading signal assistant.\n"
+        "Return ONLY valid JSON. No markdown, no extra text.\n"
+        "Your JSON must follow this schema:\n"
+        "{"
+        "\"action\":\"BUY|SELL|WAIT\","
+        "\"pair\":\"string\","
+        "\"timeframe\":\"string\","
+        "\"bias\":\"Bullish|Bearish|Sideways\","
+        "\"confidence\": number(0-100),"
+        "\"entry\": number|null,"
+        "\"sl\": number|null,"
+        "\"tp1\": number|null,"
+        "\"tp2\": number|null,"
+        "\"tp3\": number|null,"
+        "\"note\":\"short string\""
+        "}\n"
+        "Rules:\n"
+        "- If no clear confirmation, action MUST be WAIT.\n"
+        "- If action is WAIT: entry/sl/tp1/tp2/tp3 must be null.\n"
+        "- If BUY/SELL: MUST provide entry, sl, tp1,tp2,tp3.\n"
+        "- Keep note short (<= 120 chars).\n"
+        "- If the image shows only candles without RSI/Stoch, still analyze using price action, EMAs, key levels, structure.\n"
+        "- Patterns: mention ONLY if clear; else say 'No clear pattern'.\n"
+        "- Prefer high accuracy over frequent signals.\n"
     )
 
-async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_vip(uid) and not is_admin(uid):
-        await send_pre(update.effective_message, vip_locked_text())
-        return
-
-    symbol = (context.args[0] if len(context.args) >= 1 else "XAUUSD").upper().strip()
-    tf = (context.args[1] if len(context.args) >= 2 else "M5").upper().strip()
-
-    gold = is_gold_mode(symbol, tf)
-    min_prob = GOLD_MODE_MIN_PROB if gold else VIP_AUTO_MIN_PROB
-
-    await update.effective_message.reply_text("⏳ Generating VIP signal...")
-    msg = generate_signal_text(symbol, tf, min_prob=min_prob, gold_mode=gold)
-    await send_pre(update.effective_message, msg)
-
-# -------- Admin VIP management --------
-async def cmd_vipadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
-        return
-    if len(context.args) < 2 or (not context.args[0].isdigit()) or (not context.args[1].isdigit()):
-        await update.effective_message.reply_text("Usage: /vipadd <user_id> <days>")
-        return
-    user_id = int(context.args[0])
-    days = int(context.args[1])
-    exp = set_vip(user_id, days)
-    await update.effective_message.reply_text(
-        f"✅ VIP added for {user_id} for {days} days.\nExpires: {exp.strftime('%Y-%m-%d %H:%M UTC')}"
+    user_prompt = (
+        f"{mode_constraints_prompt()}\n"
+        f"Min confidence threshold for action (BUY/SELL) is: {mode_threshold()}.\n"
+        "Analyze the provided chart screenshot and create ONE clean decision.\n"
+        "Output must be JSON only.\n"
     )
+    if extra_prompt:
+        user_prompt += "\n" + extra_prompt.strip()
 
-async def cmd_vipremove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
-        return
-    if len(context.args) < 1 or (not context.args[0].isdigit()):
-        await update.effective_message.reply_text("Usage: /vipremove <user_id>")
-        return
-    user_id = int(context.args[0])
-    remove_vip(user_id)
-    await update.effective_message.reply_text(f"✅ VIP removed for {user_id}")
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
+    # base64 encode image
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-# ================== PHOTO HANDLER ==================
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    uid = update.effective_user.id
-
-    await msg.reply_text("📸 Received. Analyzing...")
+    payload = {
+        "model": DEFAULT_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "text", "text": system}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
+            ]}
+        ],
+        "temperature": 0.2
+    }
 
     try:
-        photo = msg.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        image_bytes = await tg_file.download_as_bytearray()
+        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        raw = r.text
+        if r.status_code != 200:
+            return None, raw
 
-        # Decide mode
-        vip = is_vip(uid) or is_admin(uid)
+        data = r.json()
 
-        # VIP photo analysis uses stricter logic (but still simple output)
-        # For gold charts, we apply Gold Mode min_prob if symbol/tf can be inferred by model.
-        # We can't reliably parse symbol/tf before analysis, so:
-        # - VIP analysis uses VIP_AUTO_MIN_PROB
-        # - Model will include symbol/timeframe; users can send /signal for forced Gold Mode.
-        mode = "vip" if vip else "lite"
-        min_prob = VIP_AUTO_MIN_PROB if vip else 60  # Lite slightly looser for engagement
+        # Responses API often returns text in output[0].content[0].text
+        # We handle a couple shapes defensively:
+        text = ""
+        try:
+            # typical
+            out = data.get("output", [])
+            if out and out[0].get("content"):
+                text = out[0]["content"][0].get("text", "") or ""
+        except Exception:
+            pass
 
-        result = analyze_image(image_bytes, mode=mode, min_prob=min_prob)
-        await send_pre(msg, result)
+        if not text:
+            # fallback: sometimes "output_text" is present
+            text = data.get("output_text", "") or ""
+
+        text = (text or "").strip()
+        if not text:
+            return None, raw
+
+        # Parse strict JSON
+        try:
+            j = json.loads(text)
+            return j, text
+        except json.JSONDecodeError:
+            # second attempt: extract first JSON object
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1]
+                try:
+                    j = json.loads(candidate)
+                    return j, text
+                except Exception:
+                    return None, text
+            return None, text
 
     except Exception as e:
-        log.exception(f"PHOTO_ERROR: {e}")
-        await msg.reply_text("🟡 WAIT\nPlease resend a clearer chart image.")
+        return None, str(e)
 
 
-# ================== RUN ==================
+# =========================
+# DECISION SANITIZER (NO CONTRADICTION, SHORT)
+# =========================
+def sanitize_result(j: Dict[str, Any]) -> Dict[str, Any]:
+    action = (j.get("action") or "WAIT").upper().strip()
+    pair = (j.get("pair") or "XAUUSD").upper().strip()
+    tf = (j.get("timeframe") or "M5").upper().strip()
+    bias = (j.get("bias") or "Sideways").strip()
+    conf = int(float(j.get("confidence") or 0))
+
+    # Apply threshold: if below threshold, force WAIT
+    if action in ("BUY", "SELL") and conf < mode_threshold():
+        action = "WAIT"
+
+    def num_or_none(x):
+        if x is None:
+            return None
+        try:
+            return round(float(x), 2)
+        except Exception:
+            return None
+
+    entry = num_or_none(j.get("entry"))
+    sl = num_or_none(j.get("sl"))
+    tp1 = num_or_none(j.get("tp1"))
+    tp2 = num_or_none(j.get("tp2"))
+    tp3 = num_or_none(j.get("tp3"))
+    note = (j.get("note") or "").strip()
+
+    if action == "WAIT":
+        entry = sl = tp1 = tp2 = tp3 = None
+
+    # Ensure BUY/SELL has targets; otherwise WAIT
+    if action in ("BUY", "SELL"):
+        if any(v is None for v in [entry, sl, tp1, tp2, tp3]):
+            action = "WAIT"
+            entry = sl = tp1 = tp2 = tp3 = None
+
+    # clamp confidence
+    conf = max(0, min(100, conf))
+
+    return {
+        "action": action,
+        "pair": pair,
+        "timeframe": tf,
+        "bias": bias.title() if isinstance(bias, str) else "Sideways",
+        "confidence": conf,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "note": note[:120] if note else ""
+    }
+
+
+# =========================
+# TELEGRAM HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Trading AI\nSend a chart image to get a clean signal.\nType /plans for pricing.\nType /help for commands.")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(PLANS_TEXT)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_vip(uid):
+        await update.message.reply_text(f"✅ VIP Active\nDays left: {vip_days_left(uid)}\nMode: {current_mode()}")
+    else:
+        await update.message.reply_text(f"🔒 VIP Inactive\nMode: {current_mode()}\n\n{FREE_TEXT}")
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(f"Mode: {current_mode()}\nUse: /mode gold OR /mode all")
+        return
+
+    m = context.args[0].strip().upper()
+    if m not in ("GOLD", "ALL"):
+        await update.message.reply_text("❌ Invalid mode. Use /mode gold or /mode all")
+        return
+
+    set_setting("MODE", m)
+    await update.message.reply_text(f"✅ Mode updated: {m}")
+
+async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /vipadd <user_id> <days>\nExample: /vipadd 123456789 30")
+        return
+    try:
+        user_id = int(context.args[0])
+        days = int(context.args[1])
+        add_vip(user_id, days)
+        await update.message.reply_text(f"✅ VIP added: {user_id} for {days} days")
+    except Exception:
+        await update.message.reply_text("❌ Invalid arguments.")
+
+async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /vipremove <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+        remove_vip(user_id)
+        await update.message.reply_text(f"✅ VIP removed: {user_id}")
+    except Exception:
+        await update.message.reply_text("❌ Invalid user_id.")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # VIP gating
+    if not is_vip(uid):
+        await update.message.reply_text(FREE_TEXT)
+        await update.message.reply_text("💳 Type /plans to subscribe.")
+        return
+
+    await update.message.reply_text("📸 Received. Analyzing...")
+
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
+
+        # AI analysis
+        j, raw = call_openai_vision(bytes(image_bytes))
+        if not j:
+            # Keep error short (no long logs to user)
+            await update.message.reply_text("❌ Analysis failed. Try again with a clearer chart screenshot.")
+            return
+
+        res = sanitize_result(j)
+
+        # If mode GOLD, enforce XAUUSD preference in output name only (analysis already guided)
+        if current_mode() == "GOLD":
+            # If model returned other symbol, we still show it but you can force:
+            # res["pair"] = "XAUUSD"
+            pass
+
+        msg = fmt_signal(res)
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        logging.exception(e)
+        await update.message.reply_text("❌ Error while processing image. Please try again.")
+
+
+# =========================
+# MAIN
+# =========================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing.")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing.")
+        raise RuntimeError("Missing BOT_TOKEN env var")
 
-    db_init()
+    init_db()
+    # persist mode in DB if missing
+    if not get_setting("MODE"):
+        set_setting("MODE", DEFAULT_MODE)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Public
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("plans", cmd_plans))
-    app.add_handler(CommandHandler("myid", cmd_myid))
-    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("plans", plans))
+    app.add_handler(CommandHandler("status", status))
 
     # Admin
-    app.add_handler(CommandHandler("vipadd", cmd_vipadd))
-    app.add_handler(CommandHandler("vipremove", cmd_vipremove))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("vipadd", vipadd_cmd))
+    app.add_handler(CommandHandler("vipremove", vipremove_cmd))
 
     # Photos
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    log.info("Trading AI Bot running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
