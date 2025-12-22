@@ -2,6 +2,6 @@ services:
   - type: web
     name: trading-ai-bot
     env: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
