@@ -21,8 +21,8 @@ from openai import OpenAI
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# Admin (Required for VIP management commands)
-# ضع رقمك من /myid داخل Render Environment
+# Admin (Optional at first run)
+# ضع رقمك من /myid داخل Render Environment لاحقاً
 ADMIN_USER_ID_RAW = os.environ.get("ADMIN_USER_ID", "").strip()
 ADMIN_ID = int(ADMIN_USER_ID_RAW) if ADMIN_USER_ID_RAW.isdigit() else None
 
@@ -213,10 +213,7 @@ def format_message(ar: dict, en: dict) -> str:
     )
 
     if (ar.get("action") or "").upper().strip() == "WAIT":
-        msg += (
-            f"\n⏳ الانتظار لأن: {ar_wait_reason}\n"
-            f"🧠 ملخص: {ar_reason}\n"
-        )
+        msg += f"\n⏳ الانتظار لأن: {ar_wait_reason}\n🧠 ملخص: {ar_reason}\n"
     else:
         msg += (
             f"\n🎯 دخول: {ar_entry}\n"
@@ -240,10 +237,7 @@ def format_message(ar: dict, en: dict) -> str:
     )
 
     if (en.get("action") or "").upper().strip() == "WAIT":
-        msg += (
-            f"\n⏳ Wait because: {en_wait_reason}\n"
-            f"🧠 Summary: {en_reason}\n"
-        )
+        msg += f"\n⏳ Wait because: {en_wait_reason}\n🧠 Summary: {en_reason}\n"
     else:
         msg += (
             f"\n🎯 Entry: {en_entry}\n"
@@ -273,46 +267,7 @@ Rules:
 - Prefer WAIT when confirmation is missing.
 - Keep reason max 2 lines.
 
-Output VALID JSON ONLY:
-
-{
-  "ar": {
-    "symbol": "… or غير واضح",
-    "timeframe": "… or غير واضح",
-    "action": "BUY or SELL or WAIT",
-    "probability": 0,
-    "confidence": "High/Medium/Low or غير واضح",
-    "pattern_name": "اسم النموذج أو غير واضح",
-    "pattern_bias": "Bullish/Bearish/Neutral or غير واضح",
-    "key_level": "أهم مستوى (دعم/مقاومة/عنق) أو غير واضح",
-    "entry": "… or غير واضح",
-    "sl": "… or غير واضح",
-    "tp1": "… or غير واضح",
-    "tp2": "… or غير واضح",
-    "reason": "سبب مختصر جداً (سطرين max)",
-    "wait_reason": "اذا WAIT فقط (سطر واحد)",
-    "tips": ["3 نصائح عملية قصيرة"],
-    "warning": "⚠️ تنبيه: التحليل تعليمي والنسبة تقديرية وليست ضمان. المخاطرة 1–2% فقط."
-  },
-  "en": {
-    "symbol": "… or Not clear",
-    "timeframe": "… or Not clear",
-    "action": "BUY or SELL or WAIT",
-    "probability": 0,
-    "confidence": "High/Medium/Low or Not clear",
-    "pattern_name": "Pattern name or Not clear",
-    "pattern_bias": "Bullish/Bearish/Neutral or Not clear",
-    "key_level": "Key level or Not clear",
-    "entry": "… or Not clear",
-    "sl": "… or Not clear",
-    "tp1": "… or Not clear",
-    "tp2": "… or Not clear",
-    "reason": "Very short reason (max 2 lines)",
-    "wait_reason": "Only if WAIT (one line)",
-    "tips": ["3 short practical tips"],
-    "warning": "⚠️ Warning: Educational only. Probability is an estimate (not guaranteed). Risk max 1–2%."
-  }
-}
+Output VALID JSON ONLY with ar/en blocks and required fields.
 """
 
 def analyze_with_ai(image_bytes: bytes) -> str:
@@ -328,13 +283,10 @@ def analyze_with_ai(image_bytes: bytes) -> str:
         }]
     )
     raw = (resp.output_text or "").strip()
-    try:
-        data = json.loads(raw)
-        ar = data.get("ar", {}) if isinstance(data, dict) else {}
-        en = data.get("en", {}) if isinstance(data, dict) else {}
-        return format_message(ar, en)
-    except Exception:
-        return _clean("⚠️ AI رجّع رد غير منظم. هذا النص كما هو:\n\n" + raw)
+    data = json.loads(raw)
+    ar = data.get("ar", {}) if isinstance(data, dict) else {}
+    en = data.get("en", {}) if isinstance(data, dict) else {}
+    return format_message(ar, en)
 
 
 def generate_signal(symbol: str, timeframe: str) -> str:
@@ -355,20 +307,17 @@ Rules:
 - Always give practical tips (even if WAIT).
 - Keep reason max 2 lines.
 
-Return the same JSON structure as IMAGE_PROMPT (ar/en).
+Return JSON with ar/en blocks and required fields.
 """
     resp = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt
     )
     raw = (resp.output_text or "").strip()
-    try:
-        data = json.loads(raw)
-        ar = data.get("ar", {}) if isinstance(data, dict) else {}
-        en = data.get("en", {}) if isinstance(data, dict) else {}
-        return format_message(ar, en)
-    except Exception:
-        return _clean("⚠️ AI returned unstructured signal:\n\n" + raw)
+    data = json.loads(raw)
+    ar = data.get("ar", {}) if isinstance(data, dict) else {}
+    en = data.get("en", {}) if isinstance(data, dict) else {}
+    return format_message(ar, en)
 
 
 # ================== Commands ==================
@@ -389,7 +338,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- أرسل صورة شارت واضحة للتحليل\n"
         "- /signal يعطي إشارة بدون صورة (VIP فقط)\n"
         "- /myid يطلع رقمك + حالة VIP\n\n"
-        "Admin:\n"
+        "Admin (بعد ما تضيف ADMIN_USER_ID):\n"
         "/vipadd <user_id> <days>\n"
         "/vipremove <user_id>\n"
         "/vipcheck <user_id>\n"
@@ -404,8 +353,11 @@ async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vip_line = f"\n✅ VIP Active until: {exp_str}\n✅ VIP فعال حتى: {exp_str}"
     else:
         vip_line = "\n🔒 VIP: غير مفعل\n🔒 VIP: Not active"
+    admin_hint = ""
+    if ADMIN_ID is None:
+        admin_hint = "\n\n⚠️ Admin غير مفعّل بعد.\nضع هذا الرقم في Render كـ ADMIN_USER_ID ثم Redeploy."
     await update.effective_message.reply_text(
-        f"🆔 Your Telegram ID: {uid}\n🆔 رقمك في تيليجرام: {uid}{vip_line}"
+        f"🆔 Your Telegram ID: {uid}\n🆔 رقمك في تيليجرام: {uid}{vip_line}{admin_hint}"
     )
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,7 +386,7 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
+        await update.effective_message.reply_text("❌ Admin only (فعّل ADMIN_USER_ID أولاً).")
         return
 
     if len(context.args) < 2:
@@ -455,7 +407,7 @@ async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
+        await update.effective_message.reply_text("❌ Admin only (فعّل ADMIN_USER_ID أولاً).")
         return
     if len(context.args) < 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text("استخدم: /vipremove <user_id>")
@@ -467,7 +419,7 @@ async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
+        await update.effective_message.reply_text("❌ Admin only (فعّل ADMIN_USER_ID أولاً).")
         return
     if len(context.args) < 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text("استخدم: /vipcheck <user_id>")
@@ -482,7 +434,7 @@ async def vipcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def viplist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
-        await update.effective_message.reply_text("❌ Admin only.")
+        await update.effective_message.reply_text("❌ Admin only (فعّل ADMIN_USER_ID أولاً).")
         return
     rows = list_vips(limit=50)
     if not rows:
@@ -517,10 +469,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Error | خطأ:\n{type(e).__name__}\n{e}")
 
 
-# ================== Optional: ignore plain text (fix command issues) ==================
+# ================== Ignore normal text ==================
 async def ignore_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # We intentionally ignore normal text messages to keep the bot clean.
-    # Commands (/...) will still work.
+    # ignore text to keep chat clean
     return
 
 
@@ -530,9 +481,10 @@ def main():
         raise RuntimeError("❌ BOT_TOKEN غير موجود في Render → Environment.")
     if not OPENAI_API_KEY:
         raise RuntimeError("❌ OPENAI_API_KEY غير موجود في Render → Environment.")
+
+    # ✅ IMPORTANT CHANGE: Do NOT crash if ADMIN not set yet
     if ADMIN_ID is None:
-        # IMPORTANT: keep running even if ADMIN not set? No, for VIP management we require it.
-        raise RuntimeError("❌ ADMIN_USER_ID غير موجود. احصل عليه من /myid ثم ضعه في Render Environment.")
+        logger.warning("⚠️ ADMIN_USER_ID is not set yet. Running in limited mode. Use /myid to get your ID.")
 
     db_init()
 
@@ -553,7 +505,7 @@ def main():
     # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # ✅ Fix: ignore normal text so it doesn't interfere with commands
+    # Ensure commands are not blocked by plain text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ignore_text))
 
     logger.info("🤖 Trading AI Bot is running...")
