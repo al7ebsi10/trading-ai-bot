@@ -1,15 +1,18 @@
 import os
 import json
 import time
-import sqlite3
 import base64
+import sqlite3
 import logging
 import asyncio
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
+from fastapi import FastAPI, Request, HTTPException
+
 from telegram import Update
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -25,22 +28,36 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-DEFAULT_MODE = os.getenv("DEFAULT_MODE", "ALL").strip().upper()  # ALL or GOLD
 DB_PATH = os.getenv("DB_PATH", "vip.db")
 
-# Free trial: number of analyses allowed for free users
-FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5"))
+# FREE trial count
+FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5") or "5")
 
-# Confidence thresholds
-THRESH_ALL_LITE = int(os.getenv("THRESH_ALL_LITE", "62"))
-THRESH_ALL_PRO = int(os.getenv("THRESH_ALL_PRO", "67"))
-THRESH_ALL_VIP = int(os.getenv("THRESH_ALL_VIP", "70"))
+# TradingView Webhook secret
+TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "").strip()
 
-THRESH_GOLD_LITE = int(os.getenv("THRESH_GOLD_LITE", "65"))
-THRESH_GOLD_PRO = int(os.getenv("THRESH_GOLD_PRO", "70"))
-THRESH_GOLD_VIP = int(os.getenv("THRESH_GOLD_VIP", "74"))
+# Confidence thresholds (for image analysis)
+THRESH_FREE = int(os.getenv("THRESH_FREE", "55") or "55")
+THRESH_PRO = int(os.getenv("THRESH_PRO", "65") or "65")
+THRESH_VIP = int(os.getenv("THRESH_VIP", "70") or "70")
+
+# Channels (Telegram Channel IDs start with -100...)
+PRO_CHANNEL_ID = int(os.getenv("PRO_CHANNEL_ID", "0") or "0")
+VIP_GOLD_CHANNEL_ID = int(os.getenv("VIP_GOLD_CHANNEL_ID", "0") or "0")
+VIP_ALL_CHANNEL_ID = int(os.getenv("VIP_ALL_CHANNEL_ID", "0") or "0")
+VIP_PRO_CHANNEL_ID = int(os.getenv("VIP_PRO_CHANNEL_ID", "0") or "0")
+
+# Optional: send same signal also to DM for paying users
+DM_VIP_TOO = os.getenv("DM_VIP_TOO", "0").strip() == "1"
+
+# Dedupe window (seconds)
+DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "600") or "600")  # 10 minutes
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("trading-ai-bot")
+
+# Telegram Application (global)
+tg_app: Optional[Application] = None
 
 
 # =========================
@@ -54,30 +71,47 @@ def init_db():
     with db_conn() as con:
         cur = con.cursor()
 
+        # users plan
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS plans(
+            CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY,
-                plan TEXT NOT NULL,
-                expires_at INTEGER NOT NULL
+                plan TEXT NOT NULL DEFAULT 'FREE',
+                expires_at INTEGER NOT NULL DEFAULT 0
             )
             """
         )
 
+        # free trials usage
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS free_trials(
                 user_id INTEGER PRIMARY KEY,
-                used_count INTEGER NOT NULL DEFAULT 0
+                used INTEGER NOT NULL DEFAULT 0
             )
             """
         )
 
+        # dedupe keys
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS settings(
+            CREATE TABLE IF NOT EXISTS dedupe(
                 k TEXT PRIMARY KEY,
-                v TEXT NOT NULL
+                ts INTEGER NOT NULL
+            )
+            """
+        )
+
+        # signals state for management updates
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_state(
+                signal_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                action TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                last_update TEXT NOT NULL DEFAULT 'NEW'
             )
             """
         )
@@ -85,82 +119,60 @@ def init_db():
         con.commit()
 
 
-def set_setting(k: str, v: str):
+def get_user_plan(user_id: int) -> str:
     with db_conn() as con:
         cur = con.cursor()
-        cur.execute(
-            "INSERT INTO settings(k,v) VALUES(?,?) "
-            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-            (k, v),
-        )
-        con.commit()
-
-
-def get_setting(k: str, default: str = "") -> str:
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("SELECT v FROM settings WHERE k=?", (k,))
+        cur.execute("SELECT plan, expires_at FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
-        return row[0] if row else default
+        if not row:
+            return "FREE"
+
+        plan, expires_at = str(row[0]).upper(), int(row[1])
+        if plan == "FREE":
+            return "FREE"
+
+        if expires_at > int(time.time()):
+            return plan
+
+        # expired -> revert to FREE
+        cur.execute("UPDATE users SET plan='FREE', expires_at=0 WHERE user_id=?", (user_id,))
+        con.commit()
+        return "FREE"
 
 
-def current_mode() -> str:
-    m = (get_setting("MODE", DEFAULT_MODE) or DEFAULT_MODE).upper()
-    return "GOLD" if m == "GOLD" else "ALL"
+def set_user_plan(user_id: int, plan: str, days: int):
+    plan = plan.upper().strip()
+    expires_at = 0
+    if plan != "FREE":
+        expires_at = int(time.time()) + int(days) * 86400
 
-
-def set_plan(user_id: int, plan: str, days: int):
-    expires_at = int(time.time()) + int(days) * 86400
     with db_conn() as con:
         cur = con.cursor()
         cur.execute(
-            "INSERT INTO plans(user_id, plan, expires_at) VALUES(?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET plan=excluded.plan, expires_at=excluded.expires_at",
+            """
+            INSERT INTO users(user_id, plan, expires_at) VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET plan=excluded.plan, expires_at=excluded.expires_at
+            """,
             (user_id, plan, expires_at),
         )
         con.commit()
 
 
-def get_plan_row(user_id: int) -> Optional[Tuple[str, int]]:
+def list_paid_users(plans: List[str]) -> List[int]:
+    plans = [p.upper() for p in plans]
+    now = int(time.time())
+    q = ",".join(["?"] * len(plans))
     with db_conn() as con:
         cur = con.cursor()
-        cur.execute("SELECT plan, expires_at FROM plans WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return str(row[0]), int(row[1])
-
-
-def user_plan(user_id: int) -> str:
-    row = get_plan_row(user_id)
-    return row[0] if row else "FREE"
-
-
-def is_active(user_id: int) -> bool:
-    row = get_plan_row(user_id)
-    if not row:
-        return False
-    _, expires_at = row
-    return expires_at > int(time.time())
-
-
-def days_left(user_id: int) -> int:
-    row = get_plan_row(user_id)
-    if not row:
-        return 0
-    _, exp = row
-    left = exp - int(time.time())
-    return max(0, left // 86400)
-
-
-def has_access(plan: str) -> bool:
-    return plan in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO")
+        cur.execute(f"SELECT user_id FROM users WHERE plan IN ({q}) AND expires_at > ?", (*plans, now))
+        rows = cur.fetchall()
+        return [int(r[0]) for r in rows]
 
 
 def free_used(user_id: int) -> int:
     with db_conn() as con:
         cur = con.cursor()
-        cur.execute("SELECT used_count FROM free_trials WHERE user_id=?", (user_id,))
+        cur.execute("SELECT used FROM free_trials WHERE user_id=?", (user_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
@@ -169,33 +181,73 @@ def free_remaining(user_id: int) -> int:
     return max(0, FREE_TRIAL_LIMIT - free_used(user_id))
 
 
-def inc_free_used(user_id: int):
+def free_inc(user_id: int):
     with db_conn() as con:
         cur = con.cursor()
         cur.execute(
             """
-            INSERT INTO free_trials(user_id, used_count) VALUES(?, 1)
-            ON CONFLICT(user_id) DO UPDATE SET used_count = used_count + 1
+            INSERT INTO free_trials(user_id, used) VALUES(?,1)
+            ON CONFLICT(user_id) DO UPDATE SET used = used + 1
             """,
             (user_id,),
         )
         con.commit()
 
 
+def dedupe_ok(key: str) -> bool:
+    """True if allowed; False if duplicate within DEDUP_WINDOW_SEC."""
+    now = int(time.time())
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT ts FROM dedupe WHERE k=?", (key,))
+        row = cur.fetchone()
+        if row:
+            ts = int(row[0])
+            if now - ts < DEDUP_WINDOW_SEC:
+                return False
+
+        cur.execute(
+            "INSERT INTO dedupe(k, ts) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET ts=excluded.ts",
+            (key, now),
+        )
+
+        # cleanup older than 24h
+        cur.execute("DELETE FROM dedupe WHERE ts < ?", (now - 86400,))
+        con.commit()
+
+    return True
+
+
+def save_signal_state(signal_id: str, symbol: str, timeframe: str, action: str, update: str):
+    now = int(time.time())
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_state(signal_id, symbol, timeframe, action, created_ts, last_update)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(signal_id) DO UPDATE SET last_update=excluded.last_update
+            """,
+            (signal_id, symbol, timeframe, action, now, update),
+        )
+        con.commit()
+
+
 # =========================
-# UI / TEXT
+# TEXT / PLANS
 # =========================
 PLANS_TEXT = """\
 💎 Trading AI – Plans
 
-$49  - VIP_GOLD (XAUUSD, M5/M15)
-$99  - VIP_ALL  (All pairs & timeframes)
-$119 - VIP_PRO  (VIP_ALL + priority updates)
+🟢 FREE: 5 chart analyses (full setup: Bias + Entry Zone + SL + TP1/2/3 + Caution)
 
-🎁 Free Trial:
-• 5 chart analyses FREE, then subscription required.
+$49  - LITE (manual images only)
+$99  - PRO (Auto Signals via TradingView + images)
+$119 - VIP GOLD (Auto Signals Gold priority + images)
+$149 - VIP ALL  (Auto Signals all pairs+gold + images)
+$199 - VIP PRO  (strongest filters + priority + auto updates)
 
-To subscribe, contact admin.
+To activate: contact admin.
 """
 
 HELP_TEXT = """\
@@ -203,167 +255,200 @@ HELP_TEXT = """\
 
 Commands:
 - /start
+- /help
 - /plans
 - /status
 - /myid
 
 Admin:
-- /setplan <user_id> <plan> <days>
-  plans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO
-- /mode gold | /mode all
-
-Usage:
-Send a chart image (candles only OK).
-Bot returns: BUY/SELL/WAIT + Entry/SL/TP1/TP2/TP3 + Confidence.
+- /setplan <user_id> <PLAN> <days>
+PLANS: FREE, LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO
+Example:
+  /setplan 7269750900 VIP_ALL 365
 """
 
 DISCLAIMER = "⚠️ Educational only | Risk 1–2%"
 
 
 # =========================
-# Thresholds / Prompts
+# Delivery targets (Best setup)
 # =========================
-def required_threshold(plan: str) -> int:
-    mode = current_mode()
+def targets_for_plan(plan: str) -> Dict[str, Any]:
+    plan = plan.upper()
 
-    # ✅ FREE TRIAL: useful + not too strict
-    if plan == "FREE_TRIAL":
-        return 62 if mode == "ALL" else 65
+    # Best choice:
+    # - PRO -> PRO channel
+    # - VIP_GOLD -> GOLD channel
+    # - VIP_ALL -> ALL channel
+    # - VIP_PRO -> VIP_PRO channel (or ALL if you want)
+    if plan == "PRO":
+        return {"channel_id": PRO_CHANNEL_ID, "dm_plans": ["PRO"] if DM_VIP_TOO else []}
+    if plan == "VIP_GOLD":
+        dm = ["VIP_GOLD", "VIP_PRO"] if DM_VIP_TOO else []
+        return {"channel_id": VIP_GOLD_CHANNEL_ID, "dm_plans": dm}
+    if plan == "VIP_ALL":
+        dm = ["VIP_ALL", "VIP_PRO"] if DM_VIP_TOO else []
+        return {"channel_id": VIP_ALL_CHANNEL_ID, "dm_plans": dm}
+    if plan == "VIP_PRO":
+        dm = ["VIP_PRO"] if DM_VIP_TOO else []
+        return {"channel_id": VIP_PRO_CHANNEL_ID or VIP_ALL_CHANNEL_ID, "dm_plans": dm}
 
-    if mode == "GOLD":
-        if plan == "VIP_GOLD":
-            return THRESH_GOLD_VIP
-        if plan in ("VIP_ALL", "VIP_PRO", "PRO"):
-            return THRESH_GOLD_PRO
-        return THRESH_GOLD_LITE
-    else:
-        if plan in ("VIP_ALL", "VIP_PRO"):
-            return THRESH_ALL_VIP
-        if plan == "PRO":
-            return THRESH_ALL_PRO
-        return THRESH_ALL_LITE
-
-
-def mode_constraints_prompt() -> str:
-    if current_mode() == "GOLD":
-        return (
-            "Mode: GOLD\n"
-            "- Focus XAUUSD (Gold) primarily.\n"
-            "- Prefer M5/M15.\n"
-            "- Be strict: avoid signals unless clear.\n"
-        )
-    return (
-        "Mode: ALL\n"
-        "- Any symbol/timeframe.\n"
-        "- Still avoid low-quality signals.\n"
-    )
+    # fallback
+    return {"channel_id": 0, "dm_plans": []}
 
 
 # =========================
-# Formatting
+# Telegram send helpers
 # =========================
-def fmt_signal(res: Dict[str, Any], plan: str, trial_remaining: Optional[int] = None) -> str:
+async def tg_send(user_id: int, text: str):
+    global tg_app
+    if not tg_app:
+        return
+    try:
+        await tg_app.bot.send_message(chat_id=user_id, text=text)
+    except Exception:
+        pass
+
+
+async def tg_send_to_channel(channel_id: int, text: str):
+    global tg_app
+    if not tg_app or not channel_id:
+        return
+    try:
+        await tg_app.bot.send_message(chat_id=channel_id, text=text)
+    except Exception:
+        pass
+
+
+# =========================
+# Formatting (Image analysis output)
+# FREE must output full setup always (even if WAIT -> SETUP)
+# =========================
+def fmt_image_result(res: Dict[str, Any], plan: str, trial_left: Optional[int]) -> str:
     action = (res.get("action") or "WAIT").upper()
     pair = (res.get("pair") or "N/A").upper()
     tf = (res.get("timeframe") or "N/A").upper()
-    bias = (res.get("bias") or "Neutral").title()
+    bias = (res.get("market_bias") or "Neutral").title()
     conf = int(res.get("confidence") or 0)
 
-    note = (res.get("note") or "").strip()
-    note_line = f"\n🧠 Note: {note}" if note else ""
+    entry_zone = res.get("entry_zone") or {}
+    buy_zone = entry_zone.get("buy")
+    sell_zone = entry_zone.get("sell")
 
-    trial_line = ""
-    if plan == "FREE_TRIAL" and trial_remaining is not None:
-        trial_line = f"\n🧪 Free Trial remaining: {trial_remaining}/{FREE_TRIAL_LIMIT}"
+    sl = res.get("sl")
+    tp1 = res.get("tp1")
+    tp2 = res.get("tp2")
+    tp3 = res.get("tp3")
 
-    # Watch levels (even for WAIT)
-    wba = res.get("watch_buy_above")
-    wsb = res.get("watch_sell_below")
-    watch_lines = ""
-    if wba is not None:
-        watch_lines += f"\n📈 Buy if breaks above: {wba}"
-    if wsb is not None:
-        watch_lines += f"\n📉 Sell if breaks below: {wsb}"
+    levels = res.get("levels") or {}
+    buy_break = levels.get("buy_break")
+    sell_break = levels.get("sell_break")
 
-    if action == "WAIT":
-        return (
-            f"🟡 WAIT | {pair} {tf} | {conf}%\n\n"
-            f"No clean confirmation.\n"
-            f"Wait for clearer price action."
-            f"{note_line}"
-            f"{watch_lines}"
-            f"{trial_line}\n\n"
-            f"{DISCLAIMER}"
-        ).strip()
+    caution = (res.get("caution") or "").strip()
 
-    return (
-        f"🟢 {action} | {pair} {tf} | {bias} | {conf}%\n\n"
-        f"🎯 Entry: {res.get('entry')}\n"
-        f"🛑 SL: {res.get('sl')}\n"
-        f"✅ TP1: {res.get('tp1')}\n"
-        f"✅ TP2: {res.get('tp2')}\n"
-        f"✅ TP3: {res.get('tp3')}"
-        f"{note_line}"
-        f"{trial_line}\n\n"
-        f"{DISCLAIMER}"
-    ).strip()
+    header_action = "SETUP" if action == "WAIT" else action
+    icon = "🟡" if action == "WAIT" else ("🟢" if action == "BUY" else "🔴")
+
+    lines = [
+        f"{icon} {header_action} | {pair} {tf} | {conf}%",
+        "",
+        f"📌 Market Bias: {bias}",
+        "",
+        "🎯 Entry Zone:",
+    ]
+
+    if buy_zone:
+        lines.append(f"🟢 Buy Zone: {buy_zone}")
+    if sell_zone:
+        lines.append(f"🔴 Sell Zone: {sell_zone}")
+    if (not buy_zone) and (not sell_zone):
+        lines.append("—")
+
+    lines += [
+        "",
+        f"🛑 SL: {sl}",
+        f"✅ TP1: {tp1}",
+        f"✅ TP2: {tp2}",
+        f"✅ TP3: {tp3}",
+        "",
+        "📈 Trigger Levels:",
+    ]
+
+    if buy_break is not None:
+        lines.append(f"⬆️ Buy if breaks above: {buy_break}")
+    if sell_break is not None:
+        lines.append(f"⬇️ Sell if breaks below: {sell_break}")
+    if (buy_break is None) and (sell_break is None):
+        lines.append("—")
+
+    if caution:
+        lines += ["", f"⚠️ Caution: {caution[:180]}"]
+
+    if plan == "FREE" and trial_left is not None:
+        lines += ["", f"🧪 Free Trial remaining: {trial_left}/{FREE_TRIAL_LIMIT}", "Upgrade: /plans"]
+
+    lines += ["", DISCLAIMER]
+    return "\n".join(lines).strip()
 
 
 # =========================
-# OpenAI Vision (blocking)
+# OpenAI Vision (Responses API)
+# Important: input_text + input_image
+# FREE returns full setup always
 # =========================
-def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str, Any]], str]:
+def call_openai_vision(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str, Any]], str]:
     if not OPENAI_API_KEY:
         return None, "Missing OPENAI_API_KEY"
 
-    threshold = required_threshold(plan)
+    plan = plan.upper()
+    if plan in ("VIP_GOLD", "VIP_ALL", "VIP_PRO"):
+        min_conf = THRESH_VIP
+    elif plan == "PRO":
+        min_conf = THRESH_PRO
+    else:
+        min_conf = THRESH_FREE
 
     system_prompt = (
         "You are a professional trading signal assistant.\n"
-        "Return ONLY valid JSON. No markdown, no extra text.\n"
+        "Return ONLY valid JSON. No markdown.\n"
         "Schema:\n"
         "{"
         "\"action\":\"BUY|SELL|WAIT\","
         "\"pair\":\"string\","
         "\"timeframe\":\"string\","
-        "\"bias\":\"Bullish|Bearish|Sideways\","
+        "\"market_bias\":\"Bullish|Bearish|Neutral\","
         "\"confidence\": number(0-100),"
-        "\"entry\": number|null,"
-        "\"sl\": number|null,"
-        "\"tp1\": number|null,"
-        "\"tp2\": number|null,"
-        "\"tp3\": number|null,"
-        "\"watch_buy_above\": number|null,"
-        "\"watch_sell_below\": number|null,"
-        "\"note\":\"short string\""
+        "\"entry_zone\": {\"buy\":\"string|null\",\"sell\":\"string|null\"},"
+        "\"sl\": number,"
+        "\"tp1\": number,"
+        "\"tp2\": number,"
+        "\"tp3\": number,"
+        "\"levels\": {\"buy_break\": number|null, \"sell_break\": number|null},"
+        "\"caution\":\"short string\""
         "}\n"
         "Rules:\n"
-        "- If no clear confirmation, action MUST be WAIT.\n"
-        "- If action is WAIT: entry/sl/tp1/tp2/tp3 must be null.\n"
-        "- If BUY/SELL: MUST provide entry, sl, tp1,tp2,tp3.\n"
-        "- If action is WAIT: set watch_buy_above and/or watch_sell_below if possible.\n"
-        "- Keep note short (<= 120 chars).\n"
-        "- If image has ONLY candles: still analyze using price action, trend, structure, key levels.\n"
-        "- Prefer high accuracy over frequent signals.\n"
+        "- Always provide market_bias.\n"
+        "- If no clean confirmation, action MUST be WAIT.\n"
+        "- EVEN IF action is WAIT: still provide entry_zone, SL, TP1-TP3, and trigger levels if possible.\n"
+        "- If indicators are missing, analyze using price action + trend + structure + key levels.\n"
+        "- SL/TP must be realistic relative to current price on the chart.\n"
+        "- Keep caution short (<= 180 chars).\n"
     )
 
     user_prompt = (
-        f"{mode_constraints_prompt()}\n"
-        f"Minimum confidence to allow BUY/SELL: {threshold}.\n"
-        "Analyze the chart screenshot and output JSON only.\n"
-        "If levels are unclear for entry/SL/TP, return WAIT but still provide watch levels if possible.\n"
+        f"Plan: {plan}\n"
+        f"Min confidence for BUY/SELL: {min_conf}\n"
+        "Analyze the chart screenshot and output ONE decision.\n"
+        "If not confirmed, output WAIT but still provide a complete SETUP.\n"
+        "Return JSON only.\n"
     )
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # ✅ IMPORTANT: input_text (NOT text)
     payload = {
         "model": DEFAULT_MODEL,
         "input": [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            },
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
             {
                 "role": "user",
                 "content": [
@@ -381,41 +466,35 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         raw = r.text
-
         if r.status_code != 200:
             return None, raw
 
         data = r.json()
 
-        # Prefer output_text
         text = (data.get("output_text") or "").strip()
-
-        # Fallback parse
         if not text:
             try:
                 out = data.get("output", [])
-                if out and out[0].get("content"):
-                    for block in out[0]["content"]:
-                        if block.get("type") == "output_text" and block.get("text"):
-                            text = (block.get("text") or "").strip()
-                            break
+                for item in out:
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text" and c.get("text"):
+                            text += c.get("text")
             except Exception:
                 pass
 
+        text = (text or "").strip()
         if not text:
             return None, raw
 
         try:
-            j = json.loads(text)
-            return j, text
+            return json.loads(text), text
         except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = text[start : end + 1]
+            s = text.find("{")
+            e = text.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                cand = text[s : e + 1]
                 try:
-                    j = json.loads(candidate)
-                    return j, text
+                    return json.loads(cand), text
                 except Exception:
                     return None, text
             return None, text
@@ -424,84 +503,75 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
         return None, str(e)
 
 
-# =========================
-# Sanitizer
-# =========================
-def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
-    threshold = required_threshold(plan)
+def sanitize_res(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
+    def to_num(x, default=None):
+        try:
+            if x is None:
+                return default
+            return round(float(x), 2)
+        except Exception:
+            return default
+
+    plan = plan.upper()
+    if plan in ("VIP_GOLD", "VIP_ALL", "VIP_PRO"):
+        min_conf = THRESH_VIP
+    elif plan == "PRO":
+        min_conf = THRESH_PRO
+    else:
+        min_conf = THRESH_FREE
 
     action = (j.get("action") or "WAIT").upper().strip()
-    pair = (j.get("pair") or "N/A").upper().strip()
-    tf = (j.get("timeframe") or "N/A").upper().strip()
-    bias = (j.get("bias") or "Sideways").strip()
     conf = int(float(j.get("confidence") or 0))
     conf = max(0, min(100, conf))
 
-    def num_or_none(x):
-        if x is None:
-            return None
-        try:
-            return round(float(x), 2)
-        except Exception:
-            return None
-
-    entry = num_or_none(j.get("entry"))
-    sl = num_or_none(j.get("sl"))
-    tp1 = num_or_none(j.get("tp1"))
-    tp2 = num_or_none(j.get("tp2"))
-    tp3 = num_or_none(j.get("tp3"))
-
-    watch_buy_above = num_or_none(j.get("watch_buy_above"))
-    watch_sell_below = num_or_none(j.get("watch_sell_below"))
-
-    note = (j.get("note") or "").strip()[:120]
-
-    # Apply threshold
-    if action in ("BUY", "SELL") and conf < threshold:
+    # if BUY/SELL but below min confidence -> WAIT
+    if action in ("BUY", "SELL") and conf < min_conf:
         action = "WAIT"
 
-    # ✅ Avoid weird 0% outputs
+    # avoid weird 0% in WAIT
     if action == "WAIT" and conf == 0:
-        conf = 50
+        conf = 55
 
-    if action == "WAIT":
-        entry = sl = tp1 = tp2 = tp3 = None
-
-    if action in ("BUY", "SELL"):
-        if any(v is None for v in (entry, sl, tp1, tp2, tp3)):
-            action = "WAIT"
-            entry = sl = tp1 = tp2 = tp3 = None
+    entry_zone = j.get("entry_zone") or {}
+    levels = j.get("levels") or {}
 
     return {
         "action": action,
-        "pair": pair,
-        "timeframe": tf,
-        "bias": bias.title() if isinstance(bias, str) else "Sideways",
+        "pair": (j.get("pair") or "XAUUSD").upper().strip(),
+        "timeframe": (j.get("timeframe") or "M5").upper().strip(),
+        "market_bias": (j.get("market_bias") or "Neutral").title(),
         "confidence": conf,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "watch_buy_above": watch_buy_above,
-        "watch_sell_below": watch_sell_below,
-        "note": note,
+        "entry_zone": {
+            "buy": entry_zone.get("buy"),
+            "sell": entry_zone.get("sell"),
+        },
+        "sl": to_num(j.get("sl"), 0),
+        "tp1": to_num(j.get("tp1"), 0),
+        "tp2": to_num(j.get("tp2"), 0),
+        "tp3": to_num(j.get("tp3"), 0),
+        "levels": {
+            "buy_break": to_num(levels.get("buy_break"), None),
+            "sell_break": to_num(levels.get("sell_break"), None),
+        },
+        "caution": (j.get("caution") or "").strip(),
     }
 
 
 # =========================
-# Telegram Handlers
+# Telegram handlers
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    rem = free_remaining(uid)
-    await update.message.reply_text(
-        "🤖 Trading AI\n"
-        "Send a chart image to get a clean signal.\n\n"
-        f"🧪 Free Trial: {rem}/{FREE_TRIAL_LIMIT} analyses remaining\n"
-        "Type /plans for pricing.\n"
-        "Type /help for commands."
-    )
+    plan = get_user_plan(uid)
+    if plan == "FREE":
+        rem = free_remaining(uid)
+        await update.message.reply_text(
+            f"🤖 Trading AI\nSend a chart image to get a full setup.\n\n🧪 Free Trial: {rem}/{FREE_TRIAL_LIMIT}\n\n/plans"
+        )
+    else:
+        await update.message.reply_text(
+            f"🤖 Trading AI\n✅ Plan: {plan}\n\nSend images anytime.\nAuto Signals will arrive automatically (PRO/VIP).\n\n/status"
+        )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -512,41 +582,21 @@ async def plans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(PLANS_TEXT)
 
 
-async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    await update.message.reply_text(f"🆔 Your Telegram ID: {uid}")
-
-
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    p = user_plan(uid)
-    if is_active(uid) and has_access(p):
+    plan = get_user_plan(uid)
+    if plan == "FREE":
         await update.message.reply_text(
-            f"✅ Active\nUser ID: {uid}\nPlan: {p}\nDays left: {days_left(uid)}\nMode: {current_mode()}"
+            f"Plan: FREE\nFree Trial remaining: {free_remaining(uid)}/{FREE_TRIAL_LIMIT}\n\n/plans"
         )
     else:
         await update.message.reply_text(
-            f"🔓 Free Trial\nUser ID: {uid}\nTrial remaining: {free_remaining(uid)}/{FREE_TRIAL_LIMIT}\nMode: {current_mode()}\n\nType /plans to upgrade."
+            f"✅ Active Plan: {plan}\n\nAuto Signals: ON (TradingView)\nImages: ON\n"
         )
 
 
-async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(f"Mode: {current_mode()}\nUse: /mode gold OR /mode all")
-        return
-
-    m = context.args[0].strip().upper()
-    if m not in ("GOLD", "ALL"):
-        await update.message.reply_text("❌ Invalid mode. Use /mode gold or /mode all")
-        return
-
-    set_setting("MODE", m)
-    await update.message.reply_text(f"✅ Mode updated: {m}")
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🆔 Your Telegram ID:\n{update.effective_user.id}")
 
 
 async def setplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,27 +607,24 @@ async def setplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 3:
         await update.message.reply_text(
-            "Usage: /setplan <user_id> <plan> <days>\n"
-            "plans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO"
+            "Usage: /setplan <user_id> <PLAN> <days>\nPLANS: FREE, LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO"
         )
         return
 
     try:
         user_id = int(context.args[0])
-        plan = context.args[1].strip().upper()
+        plan = context.args[1].upper().strip()
         days = int(context.args[2])
-
-        if plan not in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO"):
-            await update.message.reply_text("❌ Invalid plan. Use: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO")
+        if plan not in ("FREE", "LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO"):
+            await update.message.reply_text("❌ Invalid plan.")
             return
-
-        set_plan(user_id, plan, days)
+        set_user_plan(user_id, plan, days)
         await update.message.reply_text(f"✅ Set {user_id} plan={plan} for {days} days")
     except Exception:
         await update.message.reply_text("❌ Invalid arguments.")
 
 
-async def _download_bytes_from_message(update: Update) -> Optional[bytes]:
+async def _download_image_bytes(update: Update) -> Optional[bytes]:
     # PHOTO
     if update.message.photo:
         photo = update.message.photo[-1]
@@ -595,77 +642,228 @@ async def _download_bytes_from_message(update: Update) -> Optional[bytes]:
     return None
 
 
-async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    plan = user_plan(uid)
-    paid = is_active(uid) and has_access(plan)
+    plan = get_user_plan(uid)
 
-    # Free Trial gating
-    if not paid:
-        rem = free_remaining(uid)
-        if rem <= 0:
-            await update.message.reply_text("🔒 Free trial finished (5/5).\n\nTo continue, subscribe:\n/plans")
+    if plan == "FREE":
+        if free_remaining(uid) <= 0:
+            await update.message.reply_text("🔒 Free trial ended.\nUpgrade: /plans")
             return
-        plan = "FREE_TRIAL"
 
-    image_bytes = await _download_bytes_from_message(update)
-    if not image_bytes:
-        await update.message.reply_text("❌ Please send an image chart (photo or image file).")
+    img = await _download_image_bytes(update)
+    if not img:
+        await update.message.reply_text("❌ Please send a chart image (photo or image file).")
         return
 
     await update.message.reply_text("📸 Received. Analyzing...")
 
     try:
-        j, raw = await asyncio.to_thread(call_openai_vision_blocking, image_bytes, plan)
-
+        j, raw = await asyncio.to_thread(call_openai_vision, img, plan)
         if not j:
-            logging.error(f"OpenAI raw/error: {raw[:1200]}")
-            await update.message.reply_text("❌ Analysis failed. Try again with a clearer chart screenshot (zoom candles).")
+            await update.message.reply_text("❌ Analysis failed. Try a clearer screenshot (zoom candles).")
+            if uid == ADMIN_USER_ID:
+                await update.message.reply_text(f"Debug:\n{raw[:1200]}")
             return
 
-        res = sanitize_result(j, plan)
+        res = sanitize_res(j, plan)
 
-        # Show remaining BEFORE consuming the attempt (user sees correct number)
-        trial_rem = free_remaining(uid) if plan == "FREE_TRIAL" else None
-        msg = fmt_signal(res, plan, trial_remaining=trial_rem)
+        trial_left = None
+        if plan == "FREE":
+            free_inc(uid)
+            trial_left = free_remaining(uid)
+
+        msg = fmt_image_result(res, plan, trial_left)
         await update.message.reply_text(msg)
 
-        # Consume 1 free trial only after a successful analysis response
-        if plan == "FREE_TRIAL":
-            inc_free_used(uid)
-
     except Exception as e:
-        logging.exception(e)
+        logger.exception(e)
         await update.message.reply_text("❌ Error while processing image. Please try again.")
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Missing BOT_TOKEN env var")
+# =========================
+# FastAPI (TradingView Webhook)
+# =========================
+app = FastAPI()
 
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "trading-ai-bot"}
+
+
+def format_tv_message(payload: Dict[str, Any]) -> str:
+    """
+    TradingView JSON Examples:
+
+    NEW SIGNAL:
+    {
+      "secret":"TV_SECRET",
+      "plan":"VIP_ALL",
+      "signal_id":"XAUUSD-M5-breakout",
+      "symbol":"XAUUSD",
+      "timeframe":"M5",
+      "action":"BUY",
+      "market_bias":"Bullish",
+      "confidence":78,
+      "entry_zone":"4423-4426",
+      "sl":4412,
+      "tp1":4432,
+      "tp2":4440,
+      "tp3":4448,
+      "caution":"..."
+    }
+
+    UPDATE:
+    {
+      "secret":"TV_SECRET",
+      "plan":"VIP_ALL",
+      "signal_id":"XAUUSD-M5-breakout",
+      "symbol":"XAUUSD",
+      "timeframe":"M5",
+      "update":"TP1_HIT",
+      "note":"Move SL to BE"
+    }
+    """
+    symbol = str(payload.get("symbol", "N/A")).upper()
+    tf = str(payload.get("timeframe", "N/A")).upper()
+
+    update = str(payload.get("update", "") or "").upper().strip()
+    note = str(payload.get("note", "") or "").strip()
+
+    if update:
+        icon = "✅" if "TP" in update else ("🛑" if "SL" in update else "ℹ️")
+        lines = [
+            f"{icon} UPDATE | {symbol} {tf}",
+            "",
+            f"🔔 Event: {update}",
+        ]
+        if note:
+            lines += ["", f"🧠 Note: {note[:180]}"]
+        lines += ["", DISCLAIMER]
+        return "\n".join(lines).strip()
+
+    action = str(payload.get("action", "SETUP")).upper()
+    bias = str(payload.get("market_bias", "Neutral")).title()
+    conf = int(float(payload.get("confidence", 0) or 0))
+
+    entry_zone = payload.get("entry_zone", "")
+    sl = payload.get("sl")
+    tp1 = payload.get("tp1")
+    tp2 = payload.get("tp2")
+    tp3 = payload.get("tp3")
+    caution = str(payload.get("caution", "")).strip()
+
+    icon = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "🟡")
+
+    lines = [
+        f"{icon} {action} | {symbol} {tf} | {conf}%",
+        "",
+        f"📌 Market Bias: {bias}",
+        "",
+        f"🎯 Entry Zone: {entry_zone}",
+        f"🛑 SL: {sl}",
+        f"✅ TP1: {tp1}",
+        f"✅ TP2: {tp2}",
+        f"✅ TP3: {tp3}",
+    ]
+    if caution:
+        lines += ["", f"⚠️ Caution: {caution[:180]}"]
+    lines += ["", DISCLAIMER]
+    return "\n".join(lines).strip()
+
+
+@app.post("/tv")
+async def tradingview_webhook(req: Request):
+    if not TV_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="TV_WEBHOOK_SECRET not set")
+
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if payload.get("secret") != TV_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    plan = str(payload.get("plan", "VIP_ALL")).upper().strip()
+    symbol = str(payload.get("symbol", "N/A")).upper()
+    tf = str(payload.get("timeframe", "N/A")).upper()
+    action = str(payload.get("action", "SETUP")).upper()
+    update = str(payload.get("update", "") or "").upper().strip()
+
+    signal_id = str(payload.get("signal_id", "")).strip()
+    if not signal_id:
+        signal_id = f"{symbol}:{tf}:{action}:{update or 'NEW'}"
+
+    # Dedupe (avoid spam)
+    dedupe_key = f"{plan}|{signal_id}"
+    if not dedupe_ok(dedupe_key):
+        return {"ok": True, "skipped": "duplicate", "key": dedupe_key}
+
+    save_signal_state(signal_id, symbol, tf, action, update or "NEW")
+
+    msg = format_tv_message(payload)
+
+    # Send targets
+    t = targets_for_plan(plan)
+    channel_id = int(t.get("channel_id") or 0)
+
+    if channel_id:
+        asyncio.create_task(tg_send_to_channel(channel_id, msg))
+
+    dm_plans = t.get("dm_plans") or []
+    if dm_plans:
+        users = list_paid_users(dm_plans)
+        for u in users:
+            asyncio.create_task(tg_send(u, msg))
+
+    return {"ok": True, "plan": plan, "channel": channel_id, "signal_id": signal_id}
+
+
+# =========================
+# Startup: run Telegram polling inside FastAPI
+# =========================
+@app.on_event("startup")
+async def on_startup():
+    global tg_app
     init_db()
 
-    if not get_setting("MODE"):
-        set_setting("MODE", DEFAULT_MODE)
+    if not BOT_TOKEN:
+        logger.error("Missing BOT_TOKEN")
+        return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("plans", plans_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("myid", myid_cmd))
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("plans", plans_cmd))
+    tg_app.add_handler(CommandHandler("status", status_cmd))
+    tg_app.add_handler(CommandHandler("myid", myid_cmd))
+    tg_app.add_handler(CommandHandler("setplan", setplan_cmd))
 
-    # Admin
-    app.add_handler(CommandHandler("mode", mode_cmd))
-    app.add_handler(CommandHandler("setplan", setplan_cmd))
+    # Images
+    tg_app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    tg_app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image))
 
-    # Photos + image documents
-    app.add_handler(MessageHandler(filters.PHOTO, analyze_image))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, analyze_image))
+    await tg_app.initialize()
+    await tg_app.start()
 
-    app.run_polling(drop_pending_updates=True)
+    # Start polling in background
+    try:
+        asyncio.create_task(tg_app.updater.start_polling(drop_pending_updates=True))
+        logger.info("Telegram polling started + FastAPI webhook ready at /tv")
+    except Exception as e:
+        logger.exception(e)
+        logger.error("Failed to start polling. Make sure python-telegram-bot version matches requirements.")
 
 
-if __name__ == "__main__":
-    main()
+@app.on_event("shutdown")
+async def on_shutdown():
+    global tg_app
+    try:
+        if tg_app:
+            await tg_app.stop()
+            await tg_app.shutdown()
+    except Exception:
+        pass
