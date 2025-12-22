@@ -125,11 +125,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         file = await photo.get_file()
         image_bytes = await file.download_as_bytearray()
-
         user_id = update.effective_user.id
         lang_mode = USER_LANG.get(user_id, DEFAULT_LANG)
 
-        await update.message.reply_text("⏳ يتم تحليل الشارت...")
+        await update.message.reply_text("⏳ جاري تحليل الشارت… انتظر قليلاً")
 
         analysis = await analyze_chart(image_bytes, lang_mode)
         await update.message.reply_text(analysis)
