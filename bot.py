@@ -162,7 +162,6 @@ def format_message(ar: dict, en: dict) -> str:
     ar_prob = _fmt_prob(ar.get("probability"), "غير واضح")
     en_prob = _fmt_prob(en.get("probability"), "Not clear")
 
-    # pattern only if clear (model decides; if unclear returns "غير واضح/Not clear")
     ar_pattern = _fmt(ar.get("pattern_name"), "غير واضح")
     en_pattern = _fmt(en.get("pattern_name"), "Not clear")
 
@@ -329,10 +328,13 @@ def analyze_with_ai(image_bytes: bytes) -> str:
         }]
     )
     raw = (resp.output_text or "").strip()
-    data = json.loads(raw)
-    ar = data.get("ar", {}) if isinstance(data, dict) else {}
-    en = data.get("en", {}) if isinstance(data, dict) else {}
-    return format_message(ar, en)
+    try:
+        data = json.loads(raw)
+        ar = data.get("ar", {}) if isinstance(data, dict) else {}
+        en = data.get("en", {}) if isinstance(data, dict) else {}
+        return format_message(ar, en)
+    except Exception:
+        return _clean("⚠️ AI رجّع رد غير منظم. هذا النص كما هو:\n\n" + raw)
 
 
 def generate_signal(symbol: str, timeframe: str) -> str:
@@ -360,10 +362,13 @@ Return the same JSON structure as IMAGE_PROMPT (ar/en).
         input=prompt
     )
     raw = (resp.output_text or "").strip()
-    data = json.loads(raw)
-    ar = data.get("ar", {}) if isinstance(data, dict) else {}
-    en = data.get("en", {}) if isinstance(data, dict) else {}
-    return format_message(ar, en)
+    try:
+        data = json.loads(raw)
+        ar = data.get("ar", {}) if isinstance(data, dict) else {}
+        en = data.get("en", {}) if isinstance(data, dict) else {}
+        return format_message(ar, en)
+    except Exception:
+        return _clean("⚠️ AI returned unstructured signal:\n\n" + raw)
 
 
 # ================== Commands ==================
@@ -429,6 +434,7 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
+        await update.effective_message.reply_text("❌ Admin only.")
         return
 
     if len(context.args) < 2:
@@ -449,6 +455,7 @@ async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
+        await update.effective_message.reply_text("❌ Admin only.")
         return
     if len(context.args) < 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text("استخدم: /vipremove <user_id>")
@@ -460,6 +467,7 @@ async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def vipcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
+        await update.effective_message.reply_text("❌ Admin only.")
         return
     if len(context.args) < 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text("استخدم: /vipcheck <user_id>")
@@ -474,6 +482,7 @@ async def vipcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def viplist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _is_admin(uid):
+        await update.effective_message.reply_text("❌ Admin only.")
         return
     rows = list_vips(limit=50)
     if not rows:
@@ -508,6 +517,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Error | خطأ:\n{type(e).__name__}\n{e}")
 
 
+# ================== Optional: ignore plain text (fix command issues) ==================
+async def ignore_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # We intentionally ignore normal text messages to keep the bot clean.
+    # Commands (/...) will still work.
+    return
+
+
 # ================== Run ==================
 def main():
     if not TOKEN:
@@ -515,12 +531,14 @@ def main():
     if not OPENAI_API_KEY:
         raise RuntimeError("❌ OPENAI_API_KEY غير موجود في Render → Environment.")
     if ADMIN_ID is None:
-        raise RuntimeError("❌ ADMIN_USER_ID غير موجود. ضع رقمك من /myid في Render Environment.")
+        # IMPORTANT: keep running even if ADMIN not set? No, for VIP management we require it.
+        raise RuntimeError("❌ ADMIN_USER_ID غير موجود. احصل عليه من /myid ثم ضعه في Render Environment.")
 
     db_init()
 
     app = Application.builder().token(TOKEN).build()
 
+    # Commands FIRST
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
@@ -532,7 +550,11 @@ def main():
     app.add_handler(CommandHandler("vipcheck", vipcheck_cmd))
     app.add_handler(CommandHandler("viplist", viplist_cmd))
 
+    # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # ✅ Fix: ignore normal text so it doesn't interfere with commands
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ignore_text))
 
     logger.info("🤖 Trading AI Bot is running...")
     app.run_polling()
