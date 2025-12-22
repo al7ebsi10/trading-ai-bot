@@ -1,5 +1,6 @@
 python-telegram-bot==21.6
-requests==2.32.3
+openai
 pillow
+requests==2.32.3
 fastapi
 uvicorn
