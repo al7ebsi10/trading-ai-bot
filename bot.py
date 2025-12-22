@@ -1,9 +1,10 @@
 import os
 import json
 import time
+import base64
 import sqlite3
 import logging
-import base64
+import asyncio
 from typing import Optional, Dict, Any, Tuple, List
 
 import requests
@@ -23,14 +24,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
 
-# OpenAI model (Vision-capable). Keep configurable.
+# Vision-capable model
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# DB
 DB_PATH = os.getenv("DB_PATH", "vip.db")
 
-# Default product/mode
-DEFAULT_MODE = os.getenv("DEFAULT_MODE", "ALL").strip().upper()  # GOLD or ALL
+# Modes: GOLD / ALL
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "ALL").strip().upper()
 
 # Thresholds (min confidence to allow BUY/SELL)
 THRESH_ALL_LITE = int(os.getenv("THRESH_ALL_LITE", "60"))
@@ -41,22 +41,12 @@ THRESH_GOLD_LITE = int(os.getenv("THRESH_GOLD_LITE", "65"))
 THRESH_GOLD_PRO  = int(os.getenv("THRESH_GOLD_PRO",  "70"))
 THRESH_GOLD_VIP  = int(os.getenv("THRESH_GOLD_VIP",  "75"))
 
-# Strictness (affects "WAIT" triggers density + demands)
-STRICT_GOLD = True
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-logging.basicConfig(level=logging.INFO)
-
-
-# =========================
-# PRODUCT TIERS
-# =========================
-# Tiers:
-# - LITE: basic clean signal
-# - PRO: more reasons + clearer triggers
-# - VIP: VIP access gate (can be GOLD or ALL)
-#
-# We store user's plan in DB: LITE / PRO / VIP_GOLD / VIP_ALL / VIP_PRO
-# VIP_PRO behaves like VIP_ALL with pro formatting (more details) + higher strictness optional
+DISCLAIMER_TEXT = "⚠️ Risk: 1–2% | Educational only"
 
 PLANS_TEXT = """\
 💎 Trading AI – Plans
@@ -65,11 +55,28 @@ $49  - GOLD VIP  (XAUUSD only, M5/M15, stricter)
 $99  - VIP ALL   (All pairs & timeframes)
 $119 - VIP PRO   (All pairs & timeframes + extra clarity + priority style)
 
-🟦 Lite / Pro are internal tiers you can use for trials.
-To activate, contact admin.
+To activate VIP, contact admin.
 """
 
-DISCLAIMER_TEXT = "⚠️ Risk: 1–2% | Educational only"
+HELP_TEXT = """\
+🤖 Trading AI Bot
+
+Commands:
+- /start
+- /plans
+- /status
+
+Admin:
+- /mode gold | /mode all
+- /setplan <user_id> <plan> <days>
+  plans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO
+- /remove <user_id>
+
+Usage:
+- Send a chart image (candles only is OK).
+Output: BUY/SELL/WAIT + Entry Zone + SL + TP(3) + Confidence
+WAIT includes clear triggers (conditions to enter).
+"""
 
 
 # =========================
@@ -96,11 +103,29 @@ def init_db():
         """)
         con.commit()
 
+def migrate_db():
+    """
+    If old DB exists with vip_users(user_id, expires_at) only,
+    add column plan safely.
+    """
+    try:
+        with db_conn() as con:
+            cur = con.cursor()
+            cur.execute("PRAGMA table_info(vip_users)")
+            cols = [r[1] for r in cur.fetchall()]  # name is index 1
+            if "plan" not in cols:
+                cur.execute('ALTER TABLE vip_users ADD COLUMN plan TEXT DEFAULT "VIP_ALL"')
+                con.commit()
+                logging.info("DB migrated: added column vip_users.plan")
+    except Exception as e:
+        logging.warning(f"DB migrate skipped/failed: {e}")
+
 def set_setting(k: str, v: str):
     with db_conn() as con:
         cur = con.cursor()
         cur.execute(
-            "INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            "INSERT INTO settings(k,v) VALUES(?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             (k, v)
         )
         con.commit()
@@ -164,39 +189,42 @@ def set_mode(m: str):
 
 
 # =========================
-# TIER RULES
+# Tier rules
 # =========================
-def is_gold_plan(plan: str) -> bool:
-    return plan in ("VIP_GOLD",)
+def has_access(plan: str) -> bool:
+    return plan in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO")
 
-def is_all_plan(plan: str) -> bool:
-    return plan in ("VIP_ALL", "VIP_PRO")
+def is_gold_plan(plan: str) -> bool:
+    return plan == "VIP_GOLD"
 
 def is_pro_like(plan: str) -> bool:
     return plan in ("PRO", "VIP_PRO")
 
-def has_access(plan: str) -> bool:
-    # You can allow trial plans (LITE/PRO) as paid access too if you want:
-    return plan in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO")
-
 def required_threshold(plan: str) -> int:
     mode = current_mode()
     if mode == "GOLD":
-        if plan in ("VIP_GOLD",):
+        if plan == "VIP_GOLD":
             return THRESH_GOLD_VIP
-        if plan in ("VIP_PRO", "VIP_ALL", "PRO"):
+        if plan in ("VIP_ALL", "VIP_PRO", "PRO"):
             return THRESH_GOLD_PRO
         return THRESH_GOLD_LITE
     else:
-        if plan in ("VIP_PRO",):
+        if plan == "VIP_PRO":
             return THRESH_ALL_VIP
         if plan in ("VIP_ALL", "PRO"):
             return THRESH_ALL_PRO
         return THRESH_ALL_LITE
 
+def confidence_level(conf: int) -> str:
+    if conf >= 80:
+        return "High"
+    if conf >= 65:
+        return "Medium"
+    return "Low"
+
 def mode_constraints_prompt(plan: str) -> str:
-    mode = current_mode()
-    if mode == "GOLD":
+    m = current_mode()
+    if m == "GOLD" or is_gold_plan(plan):
         return (
             "Mode is GOLD ONLY:\n"
             "- Focus on XAUUSD (Gold).\n"
@@ -209,14 +237,9 @@ def mode_constraints_prompt(plan: str) -> str:
         "- Still prefer accuracy over frequent signals.\n"
     )
 
-def confidence_level(conf: int) -> str:
-    if conf >= 80: return "High"
-    if conf >= 65: return "Medium"
-    return "Low"
-
 
 # =========================
-# CONFIDENCE ENGINE
+# Confidence engine
 # =========================
 def compute_confidence_from_subscores(sub: Dict[str, Any]) -> int:
     def clamp(x, lo, hi):
@@ -237,7 +260,7 @@ def compute_confidence_from_subscores(sub: Dict[str, Any]) -> int:
 
 
 # =========================
-# OUTPUT FORMAT (VIP STYLE)
+# Format output
 # =========================
 def fmt_signal(res: Dict[str, Any], plan: str) -> str:
     action = (res.get("action") or "WAIT").upper()
@@ -253,7 +276,7 @@ def fmt_signal(res: Dict[str, Any], plan: str) -> str:
     if current_mode() == "GOLD" or is_gold_plan(plan):
         header = f"👑 VIP GOLD | {pair} | {tf}"
         if action == "WAIT":
-            trig_txt = "\n".join([f"• {t}" for t in triggers[:4]]) if triggers else "• Wait for RSI break + candle close"
+            trig_txt = "\n".join([f"• {t}" for t in triggers[:5]]) if triggers else "• Wait for breakout + retest"
             return f"""\
 {header}
 
@@ -282,13 +305,13 @@ TP: {tp_txt}
 Mode: Scalping
 {DISCLAIMER_TEXT}""".strip()
 
-    # VIP ALL / PRO formatting
+    # ALL / PRO style
     if action == "WAIT":
         trig_txt = "\n".join([f"• {t}" for t in triggers[:5]]) if triggers else "• Wait for breakout + retest"
         extra = ""
         if is_pro_like(plan):
-            reasons_txt = "\n".join([f"• {r}" for r in reasons[:4]]) if reasons else "• No strong confirmation"
-            extra = f"\n\n📊 State:\n{reasons_txt}"
+            st_txt = "\n".join([f"• {r}" for r in reasons[:4]]) if reasons else "• No strong confirmation"
+            extra = f"\n\n📊 State:\n{st_txt}"
         return f"""\
 🟡 WAIT | {pair} {tf}
 Confidence: {conf}% ({lvl})
@@ -322,24 +345,19 @@ Confidence: {conf}% ({lvl})
 
 
 # =========================
-# OPENAI VISION CALL
+# OpenAI Vision Call (blocking)
 # =========================
-def call_openai_vision(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Returns (json_result_or_none, raw_text)
-    Uses OpenAI Responses API.
-    """
+def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str, Any]], str]:
     if not OPENAI_API_KEY:
         return None, "Missing OPENAI_API_KEY"
 
     threshold = required_threshold(plan)
 
-    # JSON-only contract (NO "Not clear")
     system = (
         "You are a professional trading signal assistant.\n"
         "Return ONLY valid JSON. No markdown. No extra text.\n"
         "NEVER output phrases like 'Not clear' or 'Insufficient data'.\n"
-        "If chart indicators (RSI/Stoch) are not visible, still analyze using price action, structure, levels and candle confirmation.\n"
+        "If RSI/Stoch are not visible, still analyze using price action, structure, levels and candle confirmation.\n"
         "Always base decision on at least TWO of: (trend/structure, key levels, candle confirmation, volatility/cleanliness). "
         "RSI/Stoch are optional enhancers.\n\n"
         "Schema:\n"
@@ -398,14 +416,15 @@ def call_openai_vision(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str
     }
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
         raw = r.text
         if r.status_code != 200:
             return None, raw
 
         data = r.json()
-        text = ""
 
+        # extract text in multiple ways
+        text = ""
         try:
             out = data.get("output", [])
             if out and out[0].get("content"):
@@ -416,33 +435,44 @@ def call_openai_vision(image_bytes: bytes, plan: str) -> Tuple[Optional[Dict[str
         if not text:
             text = data.get("output_text", "") or ""
 
+        if not text:
+            # deeper fallback: search any output_text block
+            try:
+                out = data.get("output", [])
+                for item in out:
+                    for c in item.get("content", []):
+                        if c.get("type") in ("output_text", "text") and c.get("text"):
+                            text = c["text"]
+                            break
+                    if text:
+                        break
+            except Exception:
+                pass
+
         text = (text or "").strip()
         if not text:
             return None, raw
 
-        # Parse JSON strict
+        # parse strict json
         try:
-            j = json.loads(text)
-            return j, text
+            return json.loads(text), text
         except json.JSONDecodeError:
-            # attempt extract first json object
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = text[start:end+1]
+            s = text.find("{")
+            e = text.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                candidate = text[s:e+1]
                 try:
-                    j = json.loads(candidate)
-                    return j, text
+                    return json.loads(candidate), text
                 except Exception:
                     return None, text
             return None, text
 
     except Exception as e:
-        return None, str(e)
+        return None, repr(e)
 
 
 # =========================
-# SANITIZER (No contradictions)
+# Sanitizer
 # =========================
 def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
     action = (j.get("action") or "WAIT").upper().strip()
@@ -452,14 +482,13 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
 
     subs = j.get("subscores") or {}
     conf = compute_confidence_from_subscores(subs)
-
-    # Enforce plan + mode constraints
     threshold = required_threshold(plan)
+
     if action in ("BUY", "SELL") and conf < threshold:
         action = "WAIT"
 
-    # GOLD mode hard preference (marketing & clarity)
-    if current_mode() == "GOLD":
+    # GOLD enforcement if mode GOLD
+    if current_mode() == "GOLD" or is_gold_plan(plan):
         pair = "XAUUSD"
         if tf not in ("M5", "M15"):
             tf = "M5"
@@ -484,11 +513,10 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
     triggers = j.get("triggers") or []
     note = (j.get("note") or "").strip()[:120]
 
-    # Normalize strings (keep them short & clean)
     reasons = [str(x).strip()[:90] for x in reasons if str(x).strip()]
     triggers = [str(x).strip()[:90] for x in triggers if str(x).strip()]
 
-    # WAIT must have triggers and no prices
+    # WAIT: no prices, must have triggers
     if action == "WAIT":
         ezl = ezh = sl = None
         tps = None
@@ -499,7 +527,7 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
                 "Breakout from range + retest"
             ]
 
-    # BUY/SELL must have prices; else WAIT
+    # BUY/SELL must have all numbers
     if action in ("BUY", "SELL"):
         if any(v is None for v in [ezl, ezh, sl]) or not tps or any(x is None for x in tps):
             action = "WAIT"
@@ -509,10 +537,9 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
                 triggers = [
                     "Wait for clean breakout + retest",
                     "Confirm candle close in signal direction",
-                    "Avoid chop/sideways zone"
+                    "Avoid sideways/chop zone"
                 ]
 
-    # PRO-like: ensure reasons exist
     if is_pro_like(plan) and not reasons:
         reasons = ["Structure not fully confirmed", "Waiting for candle confirmation", "Range conditions"]
 
@@ -534,27 +561,20 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
 
 
 # =========================
-# TELEGRAM COMMANDS
+# Telegram helpers
 # =========================
-HELP_TEXT = """\
-🤖 Trading AI Bot (EN)
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not ADMIN_USER_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=text[:3500])
+    except Exception:
+        pass
 
-Commands:
-- /start
-- /plans
-- /status
 
-Admin:
-- /mode gold | /mode all
-- /setplan <user_id> <plan> <days>
-  plans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO
-- /remove <user_id>
-
-Usage:
-- Send a chart image (candles only is OK).
-Output: BUY/SELL/WAIT + Entry Zone + SL + TP(3) + Confidence + Triggers on WAIT.
-"""
-
+# =========================
+# Handlers
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Trading AI\nSend a chart image to get a clean signal.\nType /plans for pricing.\nType /help for commands.")
 
@@ -571,6 +591,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Active\nPlan: {plan}\nDays left: {days_left(uid)}\nMode: {current_mode()}")
     else:
         await update.message.reply_text(f"🔒 Inactive\nMode: {current_mode()}\n\nType /plans for pricing.")
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Alive")
 
 async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -600,15 +623,16 @@ async def setplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         user_id = int(context.args[0])
-        plan = str(context.args[1]).upper()
+        plan = str(context.args[1]).upper().strip()
         days = int(context.args[2])
         if plan not in ("LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO"):
             await update.message.reply_text("❌ Invalid plan.")
             return
         add_user_plan(user_id, days, plan)
         await update.message.reply_text(f"✅ Set {user_id} plan={plan} for {days} days")
-    except Exception:
+    except Exception as e:
         await update.message.reply_text("❌ Invalid arguments.")
+        await notify_admin(context, f"setplan error: {repr(e)}")
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -622,42 +646,84 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(context.args[0])
         remove_user(user_id)
         await update.message.reply_text(f"✅ Removed user {user_id}")
-    except Exception:
+    except Exception as e:
         await update.message.reply_text("❌ Invalid user_id.")
+        await notify_admin(context, f"remove error: {repr(e)}")
 
 
 # =========================
-# PHOTO HANDLER
+# Core analysis runner (async safe)
 # =========================
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analyze_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, image_bytes: bytes):
     uid = update.effective_user.id
     plan = user_plan(uid)
 
-    # Gate
     if not (is_active(uid) and has_access(plan)):
         await update.message.reply_text("🔒 VIP Feature\nThis bot provides VIP trading signals.\nType /plans to subscribe.")
         return
 
     await update.message.reply_text("📸 Received. Analyzing...")
 
+    loop = asyncio.get_running_loop()
+
+    def _do_call():
+        return call_openai_vision_blocking(image_bytes, plan)
+
+    try:
+        # Important: run blocking request in a thread + timeout
+        j, raw = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=55)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏳ Timeout. Please resend a clearer chart (zoom candles).")
+        await notify_admin(context, "OpenAI timeout while analyzing image.")
+        return
+    except Exception as e:
+        await update.message.reply_text("❌ Error while analyzing. Try again.")
+        await notify_admin(context, f"Analyze exception: {repr(e)}")
+        return
+
+    if not j:
+        await update.message.reply_text("❌ Analysis failed. Try again with a clearer chart screenshot (zoom candles).")
+        await notify_admin(context, f"OpenAI raw/error:\n{str(raw)[:3500]}")
+        return
+
+    res = sanitize_result(j, plan)
+    msg = fmt_signal(res, plan)
+    await update.message.reply_text(msg)
+
+
+# =========================
+# Photo / Document handlers
+# =========================
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
         image_bytes = await file.download_as_bytearray()
-
-        j, raw = call_openai_vision(bytes(image_bytes), plan)
-        if not j:
-            await update.message.reply_text("❌ Analysis failed. Try again with a clearer chart screenshot (zoom candles).")
-            return
-
-        res = sanitize_result(j, plan)
-
-        msg = fmt_signal(res, plan)
-        await update.message.reply_text(msg)
-
+        await analyze_and_reply(update, context, bytes(image_bytes))
     except Exception as e:
         logging.exception(e)
-        await update.message.reply_text("❌ Error while processing image. Please try again.")
+        await update.message.reply_text("❌ Error reading photo. Please try again.")
+        await notify_admin(context, f"handle_photo error: {repr(e)}")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        doc = update.message.document
+        if not doc:
+            await update.message.reply_text("📎 Please send a chart image (jpg/png).")
+            return
+
+        mime = (doc.mime_type or "")
+        if not mime.startswith("image/"):
+            await update.message.reply_text("📎 Please send an IMAGE file (jpg/png).")
+            return
+
+        file = await doc.get_file()
+        image_bytes = await file.download_as_bytearray()
+        await analyze_and_reply(update, context, bytes(image_bytes))
+    except Exception as e:
+        logging.exception(e)
+        await update.message.reply_text("❌ Error reading image file. Please try again.")
+        await notify_admin(context, f"handle_document error: {repr(e)}")
 
 
 # =========================
@@ -665,28 +731,43 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Missing BOT_TOKEN env var")
+        raise RuntimeError("Missing BOT_TOKEN env var (BOT_TOKEN).")
 
     init_db()
+    migrate_db()
+
     if not get_setting("MODE"):
         set_mode(DEFAULT_MODE)
 
+    logging.info("Bot starting...")
+    logging.info(f"MODE={current_mode()} | MODEL={DEFAULT_MODEL} | DB={DB_PATH}")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # basic
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("plans", plans))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("ping", ping))
 
-    # Admin
+    # admin
     app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("setplan", setplan_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
 
-    # Photos
+    # images: BOTH photo + document image (send as file)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
 
     app.run_polling()
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("🔥 BOT CRASHED:", repr(e))
+        traceback.print_exc()
+        raise
