@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -21,14 +22,14 @@ from openai import OpenAI
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# Admin (Optional at first run)
-# ضع رقمك من /myid داخل Render Environment لاحقاً
+# Admin is optional at first run (to allow /myid to work even before setting it)
 ADMIN_USER_ID_RAW = os.environ.get("ADMIN_USER_ID", "").strip()
 ADMIN_ID = int(ADMIN_USER_ID_RAW) if ADMIN_USER_ID_RAW.isdigit() else None
 
-# SQLite DB (use Render Persistent Disk if you want it to persist across deploys)
+# VIP DB path (use Render Persistent Disk if you want persistence across deploys)
 DB_PATH = os.environ.get("VIP_DB_PATH", "vip.db")
 
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 logging.basicConfig(
@@ -54,7 +55,7 @@ def db_init():
     con.commit()
     con.close()
 
-def set_vip(user_id: int, days: int):
+def set_vip(user_id: int, days: int) -> datetime:
     expires = datetime.now(timezone.utc) + timedelta(days=days)
     con = db_connect()
     cur = con.cursor()
@@ -74,7 +75,7 @@ def remove_vip(user_id: int):
     con.commit()
     con.close()
 
-def get_vip_expiry(user_id: int):
+def get_vip_expiry(user_id: int) -> Optional[datetime]:
     con = db_connect()
     cur = con.cursor()
     cur.execute("SELECT expires_at_utc FROM vip_users WHERE user_id = ?", (user_id,))
@@ -89,14 +90,15 @@ def get_vip_expiry(user_id: int):
 
 def is_vip(user_id: int) -> bool:
     exp = get_vip_expiry(user_id)
-    if not exp:
-        return False
-    return datetime.now(timezone.utc) < exp
+    return bool(exp and datetime.now(timezone.utc) < exp)
 
 def list_vips(limit: int = 50):
     con = db_connect()
     cur = con.cursor()
-    cur.execute("SELECT user_id, expires_at_utc FROM vip_users ORDER BY expires_at_utc DESC LIMIT ?", (limit,))
+    cur.execute(
+        "SELECT user_id, expires_at_utc FROM vip_users ORDER BY expires_at_utc DESC LIMIT ?",
+        (limit,)
+    )
     rows = cur.fetchall()
     con.close()
     out = []
@@ -108,11 +110,14 @@ def list_vips(limit: int = 50):
     return out
 
 
-# ================== Formatting Helpers ==================
+# ================== Helpers ==================
 def _clean(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s
+
+def _is_admin(uid: int) -> bool:
+    return ADMIN_ID is not None and uid == ADMIN_ID
 
 def _icon_action(v: str) -> str:
     v = (v or "").upper().strip()
@@ -122,11 +127,12 @@ def _icon_action(v: str) -> str:
         return "🔴 SELL"
     return "🟡 WAIT"
 
-def _fmt(x: str, fallback: str) -> str:
-    x = (x or "").strip()
+def _fmt(x: Any, fallback: str) -> str:
+    x = "" if x is None else str(x)
+    x = x.strip()
     return x if x else fallback
 
-def _fmt_prob(x, fallback: str) -> str:
+def _fmt_prob(x: Any, fallback: str) -> str:
     try:
         if x is None:
             return fallback
@@ -136,7 +142,7 @@ def _fmt_prob(x, fallback: str) -> str:
     except Exception:
         return fallback
 
-def _fmt_tips(tips, lang: str) -> str:
+def _fmt_tips(tips: Any, lang: str) -> str:
     if not isinstance(tips, list):
         return ""
     tips = [str(t).strip() for t in tips if str(t).strip()]
@@ -146,7 +152,7 @@ def _fmt_tips(tips, lang: str) -> str:
     bullets = "\n".join([f"• {t}" for t in tips[:3]])
     return f"{title}\n{bullets}\n"
 
-def format_message(ar: dict, en: dict) -> str:
+def format_message(ar: Dict[str, Any], en: Dict[str, Any]) -> str:
     ar_action = _icon_action(ar.get("action"))
     en_action = _icon_action(en.get("action"))
 
@@ -254,6 +260,30 @@ def format_message(ar: dict, en: dict) -> str:
     return _clean(msg)
 
 
+# ================== Robust JSON extraction ==================
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """
+    Try to parse JSON. If it fails, try to locate first {...} block.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty response")
+    # direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # find first JSON object by braces (best-effort)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        chunk = text[start:end+1]
+        return json.loads(chunk)
+
+    raise ValueError("No JSON object found")
+
+
 # ================== AI Prompts ==================
 IMAGE_PROMPT = """
 You are a conservative trading analyst focused on accuracy.
@@ -267,63 +297,116 @@ Rules:
 - Prefer WAIT when confirmation is missing.
 - Keep reason max 2 lines.
 
-Output VALID JSON ONLY with ar/en blocks and required fields.
+Output VALID JSON ONLY:
+{
+  "ar": {
+    "symbol":"...", "timeframe":"...", "action":"BUY/SELL/WAIT",
+    "probability":0, "confidence":"High/Medium/Low",
+    "pattern_name":"...", "pattern_bias":"Bullish/Bearish/Neutral",
+    "key_level":"...", "entry":"...", "sl":"...", "tp1":"...", "tp2":"...",
+    "reason":"...", "wait_reason":"...", "tips":["...","...","..."],
+    "warning":"⚠️ تنبيه: التحليل تعليمي والنسبة تقديرية وليست ضمان. المخاطرة 1–2% فقط."
+  },
+  "en": {
+    "symbol":"...", "timeframe":"...", "action":"BUY/SELL/WAIT",
+    "probability":0, "confidence":"High/Medium/Low",
+    "pattern_name":"...", "pattern_bias":"Bullish/Bearish/Neutral",
+    "key_level":"...", "entry":"...", "sl":"...", "tp1":"...", "tp2":"...",
+    "reason":"...", "wait_reason":"...", "tips":["...","...","..."],
+    "warning":"⚠️ Warning: Educational only. Probability is an estimate (not guaranteed). Risk max 1–2%."
+  }
+}
 """
 
-def analyze_with_ai(image_bytes: bytes) -> str:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": IMAGE_PROMPT},
-                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
-            ]
-        }]
-    )
-    raw = (resp.output_text or "").strip()
-    data = json.loads(raw)
-    ar = data.get("ar", {}) if isinstance(data, dict) else {}
-    en = data.get("en", {}) if isinstance(data, dict) else {}
+def _fallback_analysis(symbol="XAUUSD", tf="M5") -> str:
+    ar = {
+        "symbol": symbol, "timeframe": tf, "action": "WAIT",
+        "probability": 50, "confidence": "Low",
+        "pattern_name": "غير واضح", "pattern_bias": "غير واضح",
+        "key_level": "غير واضح",
+        "entry": "غير واضح", "sl": "غير واضح", "tp1": "غير واضح", "tp2": "غير واضح",
+        "reason": "الإشارة غير واضحة أو تعذر قراءة البيانات.",
+        "wait_reason": "عدم وضوح نموذج/تأكيدات كافية.",
+        "tips": ["انتظر كسر/ارتداد واضح", "تجنب السوق المتذبذب", "التزم بإدارة مخاطر 1–2%"],
+        "warning": "⚠️ تنبيه: التحليل تعليمي والنسبة تقديرية وليست ضمان. المخاطرة 1–2% فقط."
+    }
+    en = {
+        "symbol": symbol, "timeframe": tf, "action": "WAIT",
+        "probability": 50, "confidence": "Low",
+        "pattern_name": "Not clear", "pattern_bias": "Not clear",
+        "key_level": "Not clear",
+        "entry": "Not clear", "sl": "Not clear", "tp1": "Not clear", "tp2": "Not clear",
+        "reason": "Signal unclear or data could not be parsed.",
+        "wait_reason": "No clear confirmations/pattern.",
+        "tips": ["Wait for clear breakout/rejection", "Avoid choppy ranges", "Risk max 1–2% per trade"],
+        "warning": "⚠️ Warning: Educational only. Probability is an estimate (not guaranteed). Risk max 1–2%."
+    }
     return format_message(ar, en)
 
+def analyze_with_ai(image_bytes: bytes) -> str:
+    b64 = base64.b64encode(bytes(image_bytes)).decode("utf-8")
 
-def generate_signal(symbol: str, timeframe: str) -> str:
+    # Retry once if response is empty/bad json
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = client.responses.create(
+                model="gpt-4.1-mini",
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": IMAGE_PROMPT},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
+                    ]
+                }]
+            )
+            raw = (resp.output_text or "").strip()
+            data = _extract_json_object(raw)
+            ar = data.get("ar", {}) if isinstance(data, dict) else {}
+            en = data.get("en", {}) if isinstance(data, dict) else {}
+            return format_message(ar, en)
+        except Exception as e:
+            last_err = e
+            logger.warning(f"AI analyze attempt {attempt+1}/2 failed: {e}")
+
+    # fallback
+    logger.warning(f"AI analyze fallback used. last_err={last_err}")
+    return _fallback_analysis()
+
+def generate_signal_with_ai(symbol: str, timeframe: str) -> str:
     symbol = (symbol or "XAUUSD").upper().strip()
     timeframe = (timeframe or "M5").upper().strip()
 
     prompt = f"""
 You are a conservative scalping/day-trading signal provider.
-Goal: accuracy over frequency.
-
 Create a signal for Symbol={symbol}, Timeframe={timeframe}.
 
 Rules:
-- Output MUST be VALID JSON only.
+- Output MUST be VALID JSON only in the SAME schema as the image prompt.
 - Use BUY/SELL/WAIT. If not confident -> WAIT.
 - Provide probability 0-100 as an estimate (not guaranteed).
 - Do NOT mention a chart pattern unless clearly justified; otherwise pattern_name="Not clear/غير واضح".
 - Always give practical tips (even if WAIT).
 - Keep reason max 2 lines.
-
-Return JSON with ar/en blocks and required fields.
 """
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt
-    )
-    raw = (resp.output_text or "").strip()
-    data = json.loads(raw)
-    ar = data.get("ar", {}) if isinstance(data, dict) else {}
-    en = data.get("en", {}) if isinstance(data, dict) else {}
-    return format_message(ar, en)
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = client.responses.create(model="gpt-4.1-mini", input=prompt)
+            raw = (resp.output_text or "").strip()
+            data = _extract_json_object(raw)
+            ar = data.get("ar", {}) if isinstance(data, dict) else {}
+            en = data.get("en", {}) if isinstance(data, dict) else {}
+            return format_message(ar, en)
+        except Exception as e:
+            last_err = e
+            logger.warning(f"AI signal attempt {attempt+1}/2 failed: {e}")
+
+    logger.warning(f"AI signal fallback used. last_err={last_err}")
+    return _fallback_analysis(symbol=symbol, tf=timeframe)
 
 
 # ================== Commands ==================
-def _is_admin(uid: int) -> bool:
-    return ADMIN_ID is not None and uid == ADMIN_ID
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "✅ البوت شغال\n"
@@ -336,7 +419,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "📌 الاستخدام:\n"
         "- أرسل صورة شارت واضحة للتحليل\n"
-        "- /signal يعطي إشارة بدون صورة (VIP فقط)\n"
+        "- /signal XAUUSD M5 يعطي إشارة (VIP)\n"
         "- /myid يطلع رقمك + حالة VIP\n\n"
         "Admin (بعد ما تضيف ADMIN_USER_ID):\n"
         "/vipadd <user_id> <days>\n"
@@ -353,15 +436,23 @@ async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vip_line = f"\n✅ VIP Active until: {exp_str}\n✅ VIP فعال حتى: {exp_str}"
     else:
         vip_line = "\n🔒 VIP: غير مفعل\n🔒 VIP: Not active"
+
     admin_hint = ""
     if ADMIN_ID is None:
-        admin_hint = "\n\n⚠️ Admin غير مفعّل بعد.\nضع هذا الرقم في Render كـ ADMIN_USER_ID ثم Redeploy."
+        admin_hint = (
+            "\n\n⚠️ Admin غير مفعّل بعد.\n"
+            "ضع هذا الرقم في Render كـ ADMIN_USER_ID ثم Redeploy."
+        )
+
     await update.effective_message.reply_text(
-        f"🆔 Your Telegram ID: {uid}\n🆔 رقمك في تيليجرام: {uid}{vip_line}{admin_hint}"
+        f"🆔 Your Telegram ID: {uid}\n"
+        f"🆔 رقمك في تيليجرام: {uid}"
+        f"{vip_line}{admin_hint}"
     )
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
     if not is_vip(uid) and not _is_admin(uid):
         await update.effective_message.reply_text(
             "🔒 هذا الأمر VIP فقط.\n"
@@ -374,13 +465,14 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0] if len(context.args) >= 1 else "XAUUSD"
     timeframe = context.args[1] if len(context.args) >= 2 else "M5"
 
-    await update.effective_message.reply_text("⏳ جاري توليد إشارة VIP...")
+    await update.effective_message.reply_text("⏳ جاري توليد إشارة VIP ...")
     try:
-        msg = generate_signal(symbol, timeframe)
+        msg = generate_signal_with_ai(symbol, timeframe)
         await update.effective_message.reply_text(msg)
     except Exception as e:
         logger.exception("SIGNAL_ERROR")
-        await update.effective_message.reply_text(f"❌ Error | خطأ:\n{type(e).__name__}\n{e}")
+        # even here, fallback message
+        await update.effective_message.reply_text(_fallback_analysis(symbol=symbol.upper(), tf=timeframe.upper()))
 
 # ----- Admin VIP management -----
 async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,7 +482,12 @@ async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(context.args) < 2:
-        await update.effective_message.reply_text("استخدم: /vipadd <user_id> <days>\nExample: /vipadd 123456789 30")
+        await update.effective_message.reply_text(
+            "استخدم:\n"
+            "/vipadd <user_id> <days>\n"
+            "Example:\n"
+            "/vipadd 123456789 30"
+        )
         return
 
     user_id_str, days_str = context.args[0], context.args[1]
@@ -402,7 +499,10 @@ async def vipadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = int(days_str)
     expires = set_vip(user_id, days)
     exp_str = expires.strftime("%Y-%m-%d %H:%M UTC")
-    await update.effective_message.reply_text(f"✅ تم تفعيل VIP للمستخدم {user_id} لمدة {days} يوم.\nينتهي: {exp_str}")
+    await update.effective_message.reply_text(
+        f"✅ تم تفعيل VIP للمستخدم {user_id} لمدة {days} يوم.\n"
+        f"ينتهي: {exp_str}"
+    )
 
 async def vipremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -427,7 +527,10 @@ async def vipcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(context.args[0])
     exp = get_vip_expiry(user_id)
     if exp and datetime.now(timezone.utc) < exp:
-        await update.effective_message.reply_text(f"✅ VIP فعال للمستخدم {user_id}\nينتهي: {exp.strftime('%Y-%m-%d %H:%M UTC')}")
+        await update.effective_message.reply_text(
+            f"✅ VIP فعال للمستخدم {user_id}\n"
+            f"ينتهي: {exp.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
     else:
         await update.effective_message.reply_text(f"🔒 VIP غير فعال للمستخدم {user_id}")
 
@@ -454,24 +557,24 @@ async def viplist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== Photo Handler ==================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    await msg.reply_text("📸 وصلتني الصورة ✅\n⏳ جاري التحليل...")
+    await msg.reply_text("✅ وصلتني الصورة 📸\n⏳ جاري التحليل...")
 
     try:
         photo = msg.photo[-1]
         tg_file = await context.bot.get_file(photo.file_id)
         image_bytes = await tg_file.download_as_bytearray()
 
-        result = analyze_with_ai(bytes(image_bytes))
-        await msg.reply_text(result)
+        analysis = analyze_with_ai(image_bytes)
+        await msg.reply_text(analysis)
 
     except Exception as e:
         logger.exception("PHOTO_HANDLER_ERROR")
-        await msg.reply_text(f"❌ Error | خطأ:\n{type(e).__name__}\n{e}")
+        # last-resort fallback (always reply)
+        await msg.reply_text(_fallback_analysis())
 
 
 # ================== Ignore normal text ==================
 async def ignore_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ignore text to keep chat clean
     return
 
 
@@ -482,9 +585,8 @@ def main():
     if not OPENAI_API_KEY:
         raise RuntimeError("❌ OPENAI_API_KEY غير موجود في Render → Environment.")
 
-    # ✅ IMPORTANT CHANGE: Do NOT crash if ADMIN not set yet
     if ADMIN_ID is None:
-        logger.warning("⚠️ ADMIN_USER_ID is not set yet. Running in limited mode. Use /myid to get your ID.")
+        logger.warning("⚠️ ADMIN_USER_ID not set yet. Running in limited mode. Use /myid to get your ID.")
 
     db_init()
 
@@ -505,7 +607,7 @@ def main():
     # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Ensure commands are not blocked by plain text
+    # Keep chat clean (commands still work)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ignore_text))
 
     logger.info("🤖 Trading AI Bot is running...")
