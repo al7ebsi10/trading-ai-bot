@@ -226,8 +226,9 @@ DISCLAIMER = "⚠️ Educational only | Risk 1–2%"
 def required_threshold(plan: str) -> int:
     mode = current_mode()
 
+    # ✅ FREE TRIAL: useful + not too strict
     if plan == "FREE_TRIAL":
-        return 70 if mode == "ALL" else 74
+        return 62 if mode == "ALL" else 65
 
     if mode == "GOLD":
         if plan == "VIP_GOLD":
@@ -275,12 +276,22 @@ def fmt_signal(res: Dict[str, Any], plan: str, trial_remaining: Optional[int] = 
     if plan == "FREE_TRIAL" and trial_remaining is not None:
         trial_line = f"\n🧪 Free Trial remaining: {trial_remaining}/{FREE_TRIAL_LIMIT}"
 
+    # Watch levels (even for WAIT)
+    wba = res.get("watch_buy_above")
+    wsb = res.get("watch_sell_below")
+    watch_lines = ""
+    if wba is not None:
+        watch_lines += f"\n📈 Buy if breaks above: {wba}"
+    if wsb is not None:
+        watch_lines += f"\n📉 Sell if breaks below: {wsb}"
+
     if action == "WAIT":
         return (
             f"🟡 WAIT | {pair} {tf} | {conf}%\n\n"
             f"No clean confirmation.\n"
             f"Wait for clearer price action."
             f"{note_line}"
+            f"{watch_lines}"
             f"{trial_line}\n\n"
             f"{DISCLAIMER}"
         ).strip()
@@ -322,12 +333,15 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
         "\"tp1\": number|null,"
         "\"tp2\": number|null,"
         "\"tp3\": number|null,"
+        "\"watch_buy_above\": number|null,"
+        "\"watch_sell_below\": number|null,"
         "\"note\":\"short string\""
         "}\n"
         "Rules:\n"
         "- If no clear confirmation, action MUST be WAIT.\n"
         "- If action is WAIT: entry/sl/tp1/tp2/tp3 must be null.\n"
         "- If BUY/SELL: MUST provide entry, sl, tp1,tp2,tp3.\n"
+        "- If action is WAIT: set watch_buy_above and/or watch_sell_below if possible.\n"
         "- Keep note short (<= 120 chars).\n"
         "- If image has ONLY candles: still analyze using price action, trend, structure, key levels.\n"
         "- Prefer high accuracy over frequent signals.\n"
@@ -336,13 +350,13 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
     user_prompt = (
         f"{mode_constraints_prompt()}\n"
         f"Minimum confidence to allow BUY/SELL: {threshold}.\n"
-        "Analyze the chart screenshot. Output JSON only.\n"
-        "If levels are not clear, return WAIT.\n"
+        "Analyze the chart screenshot and output JSON only.\n"
+        "If levels are unclear for entry/SL/TP, return WAIT but still provide watch levels if possible.\n"
     )
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # ✅ IMPORTANT: use input_text (NOT text) — this fixes your error forever
+    # ✅ IMPORTANT: input_text (NOT text)
     payload = {
         "model": DEFAULT_MODEL,
         "input": [
@@ -382,7 +396,6 @@ def call_openai_vision_blocking(image_bytes: bytes, plan: str) -> Tuple[Optional
                 out = data.get("output", [])
                 if out and out[0].get("content"):
                     for block in out[0]["content"]:
-                        # response blocks can be output_text
                         if block.get("type") == "output_text" and block.get("text"):
                             text = (block.get("text") or "").strip()
                             break
@@ -437,10 +450,19 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
     tp1 = num_or_none(j.get("tp1"))
     tp2 = num_or_none(j.get("tp2"))
     tp3 = num_or_none(j.get("tp3"))
+
+    watch_buy_above = num_or_none(j.get("watch_buy_above"))
+    watch_sell_below = num_or_none(j.get("watch_sell_below"))
+
     note = (j.get("note") or "").strip()[:120]
 
+    # Apply threshold
     if action in ("BUY", "SELL") and conf < threshold:
         action = "WAIT"
+
+    # ✅ Avoid weird 0% outputs
+    if action == "WAIT" and conf == 0:
+        conf = 50
 
     if action == "WAIT":
         entry = sl = tp1 = tp2 = tp3 = None
@@ -461,6 +483,8 @@ def sanitize_result(j: Dict[str, Any], plan: str) -> Dict[str, Any]:
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
+        "watch_buy_above": watch_buy_above,
+        "watch_sell_below": watch_sell_below,
         "note": note,
     }
 
@@ -576,6 +600,7 @@ async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = user_plan(uid)
     paid = is_active(uid) and has_access(plan)
 
+    # Free Trial gating
     if not paid:
         rem = free_remaining(uid)
         if rem <= 0:
@@ -599,14 +624,15 @@ async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         res = sanitize_result(j, plan)
-        msg = fmt_signal(res, plan, trial_remaining=free_remaining(uid) if plan == "FREE_TRIAL" else None)
+
+        # Show remaining BEFORE consuming the attempt (user sees correct number)
+        trial_rem = free_remaining(uid) if plan == "FREE_TRIAL" else None
+        msg = fmt_signal(res, plan, trial_remaining=trial_rem)
         await update.message.reply_text(msg)
 
+        # Consume 1 free trial only after a successful analysis response
         if plan == "FREE_TRIAL":
             inc_free_used(uid)
-            await update.message.reply_text(
-                f"🧪 Free Trial: {free_remaining(uid)}/{FREE_TRIAL_LIMIT} remaining.\nUpgrade: /plans"
-            )
 
     except Exception as e:
         logging.exception(e)
@@ -630,6 +656,7 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
 
+    # Admin
     app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("setplan", setplan_cmd))
 
