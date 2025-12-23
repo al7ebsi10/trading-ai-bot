@@ -1,561 +1,429 @@
 import os
+import re
 import json
 import time
 import base64
-import sqlite3
 import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+from io import BytesIO
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-
+from PIL import Image
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# =========================================================
-# ENV
-# =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
-
+# =========================
+# Config
+# =========================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()  # vision supported
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+MODEL_VISION = os.getenv("MODEL_VISION", "gpt-4.1-mini").strip()
 
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", "5").strip() or "5")
+FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5"))
 
-# Channels (Telegram channel IDs are negative numbers usually, like -100123...)
-PRO_CHANNEL_ID = int(os.getenv("PRO_CHANNEL_ID", "0").strip() or "0")
-VIP_CHANNEL_ID = int(os.getenv("VIP_CHANNEL_ID", "0").strip() or "0")
-VIP_GOLD_CHANNEL_ID = int(os.getenv("VIP_GOLD_CHANNEL_ID", "0").strip() or "0")
+# Admin IDs: "7269750900,123"
+ADMIN_IDS = set()
+_admin_raw = os.getenv("ADMIN_IDS", "").strip()
+if _admin_raw:
+    for x in re.split(r"[,\s]+", _admin_raw):
+        x = x.strip()
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
 
-# Optional webhook auth for TradingView -> to prevent spam
-TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "").strip()
+# Optional channel IDs (if you want broadcast later)
+PRO_CHANNEL_ID = os.getenv("PRO_CHANNEL_ID", "").strip()         # e.g. -1001234567890
+VIP_GOLD_CHANNEL_ID = os.getenv("VIP_GOLD_CHANNEL_ID", "").strip()
+VIP_ALL_CHANNEL_ID = os.getenv("VIP_ALL_CHANNEL_ID", "").strip()
 
-# Timezone (UAE default GMT+4)
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "4").strip() or "4")
-TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-
-# =========================================================
-# DB (SQLite)
-# =========================================================
-DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+DB_FILE = "db.json"
+DB_LOCK = asyncio.Lock()
 
 PLANS = ["FREE", "LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO"]
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+WELCOME_TEXT = (
+    "🤖 Trading AI Bot\n\n"
+    "📌 أرسل صورة الشارت (واضحة ومقربة على الشموع) وسأعطيك:\n"
+    "• Market State (Bullish/Bearish/Neutral)\n"
+    "• Signal (Buy/Sell) + Entry Zone\n"
+    "• TP1/TP2/TP3 + SL\n"
+    "• Caution\n\n"
+    "🆓 Free Trial: 5 تحليلات صور للتجربة.\n"
+    "📌 أوامر:\n"
+    "/myid - عرض ID\n"
+    "/plans - خطط الاشتراك\n"
+)
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            plan TEXT NOT NULL DEFAULT 'FREE',
-            plan_until INTEGER NOT NULL DEFAULT 0,
-            free_used INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
+PLANS_TEXT = (
+    "💎 Plans:\n"
+    "• FREE: 5 image analyses trial\n"
+    "• LITE / PRO / VIP_GOLD / VIP_ALL / VIP_PRO\n\n"
+    "للاشتراك تواصل مع الإدارة.\n"
+)
 
-def now_ts() -> int:
+# =========================
+# DB helpers
+# =========================
+def _now_ts() -> int:
     return int(time.time())
 
-def ensure_user(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute(
-            "INSERT INTO users (user_id, plan, plan_until, free_used, created_at) VALUES (?,?,?,?,?)",
-            (user_id, "FREE", 0, 0, now_ts())
-        )
-        conn.commit()
-    conn.close()
-
-def get_user(user_id: int) -> Dict[str, Any]:
-    ensure_user(user_id)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else {"user_id": user_id, "plan": "FREE", "plan_until": 0, "free_used": 0}
-
-def set_plan(user_id: int, plan: str, days: int):
-    plan = plan.strip().upper()
-    if plan not in PLANS:
-        raise ValueError(f"Invalid plan. Allowed: {', '.join(PLANS)}")
-    until = now_ts() + int(days) * 86400
-    conn = db()
-    cur = conn.cursor()
-    ensure_user(user_id)
-    cur.execute("UPDATE users SET plan=?, plan_until=? WHERE user_id=?", (plan, until, user_id))
-    conn.commit()
-    conn.close()
-
-def get_effective_plan(user_id: int) -> str:
-    u = get_user(user_id)
-    plan = (u.get("plan") or "FREE").upper()
-    until = int(u.get("plan_until") or 0)
-    if plan != "FREE" and until > 0 and now_ts() > until:
-        # expired -> revert to FREE
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET plan='FREE', plan_until=0 WHERE user_id=?", (user_id,))
-        conn.commit()
-        conn.close()
-        return "FREE"
-    return plan
-
-def inc_free_used(user_id: int) -> int:
-    conn = db()
-    cur = conn.cursor()
-    ensure_user(user_id)
-    cur.execute("UPDATE users SET free_used = free_used + 1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    cur.execute("SELECT free_used FROM users WHERE user_id=?", (user_id,))
-    val = int(cur.fetchone()["free_used"])
-    conn.close()
-    return val
-
-def reset_free_if_new_day(user_id: int):
-    """
-    OPTIONAL: لو تبغى تصفير التجربة يوميًا.
-    حاليا: التجربة = 5 مرات فقط ثم تنتهي نهائيا.
-    """
-    return
-
-# =========================================================
-# OpenAI (Responses API) - Vision
-# =========================================================
-def openai_analyze_chart(image_bytes: bytes) -> Dict[str, Any]:
-    """
-    Returns structured signal:
-    trend, action, confidence, entry_zone, tp1,tp2,tp3, sl, caution, symbol, timeframe
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY missing")
-
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    # Responses API content types must be: input_text, input_image, output_text, etc.
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "You are a trading assistant analyzing a chart screenshot. "
-                            "IMPORTANT RULES:\n"
-                            "1) Always output a COMPLETE actionable signal (never only WAIT). If uncertainty exists, output a conservative conditional setup.\n"
-                            "2) Output JSON only (no markdown) with keys:\n"
-                            "   symbol, timeframe, market_state (BULLISH/BEARISH/NEUTRAL), action (BUY/SELL/WAIT), confidence (0-100 int),\n"
-                            "   entry_zone (string), tp1 (string), tp2 (string), tp3 (string), sl (string), caution (string).\n"
-                            "3) If you cannot read exact prices, estimate levels from visible axis/price labels and use conditional phrasing.\n"
-                            "4) Prefer breakout/structure: provide BUY above and SELL below (still fill entry_zone/tps/sl).\n"
-                            "5) Keep it short and clear.\n"
-                        )
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{b64}"
-                    }
-                ]
-            }
-        ]
+def _default_user():
+    return {
+        "plan": "FREE",
+        "expires_at": 0,
+        "trial_used": 0,
+        "created_at": _now_ts(),
     }
 
+async def load_db() -> dict:
+    async with DB_LOCK:
+        if not os.path.exists(DB_FILE):
+            return {"users": {}}
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"users": {}}
+
+async def save_db(db: dict):
+    async with DB_LOCK:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def plan_active(u: dict) -> bool:
+    p = u.get("plan", "FREE")
+    if p == "FREE":
+        return True
+    exp = int(u.get("expires_at", 0) or 0)
+    return exp > _now_ts()
+
+async def get_user(db: dict, user_id: int) -> dict:
+    uid = str(user_id)
+    if uid not in db["users"]:
+        db["users"][uid] = _default_user()
+        await save_db(db)
+    return db["users"][uid]
+
+async def set_plan(db: dict, user_id: int, plan: str, days: int):
+    plan = plan.strip().upper()
+    if plan not in PLANS:
+        raise ValueError("Invalid plan")
+    u = await get_user(db, user_id)
+    u["plan"] = plan
+    if plan == "FREE":
+        u["expires_at"] = 0
+    else:
+        u["expires_at"] = int((_now_ts() + days * 86400))
+    await save_db(db)
+
+async def trial_remaining(u: dict) -> int:
+    used = int(u.get("trial_used", 0) or 0)
+    rem = max(0, FREE_TRIAL_LIMIT - used)
+    return rem
+
+# =========================
+# OpenAI vision call (Responses API)
+# =========================
+def image_to_base64_jpeg(image_bytes: bytes, max_side: int = 1024, quality: int = 85) -> str:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    scale = min(1.0, float(max_side) / float(max(w, h)))
+    if scale < 1.0:
+        img = img.resize((int(w * scale), int(h * scale)))
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(out.getvalue()).decode("utf-8")
+
+def openai_analyze_chart(b64jpeg: str) -> dict:
+    """
+    Returns dict:
+    {
+      market_state, signal, confidence,
+      entry_zone, tp1,tp2,tp3, sl, caution,
+      reasoning_short
+    }
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
+    prompt = (
+        "You are a trading assistant analyzing a chart screenshot.\n"
+        "Return STRICT JSON ONLY (no markdown, no extra text) with these keys:\n"
+        "market_state: one of ['Bullish','Bearish','Neutral']\n"
+        "signal: one of ['BUY','SELL'] (NEVER return WAIT)\n"
+        "confidence: integer 0-100\n"
+        "entry_zone: string like '4420.0 - 4424.0' or 'Breakout above 4435.0'\n"
+        "tp1,tp2,tp3: strings (price levels)\n"
+        "sl: string (price level)\n"
+        "caution: short string\n"
+        "reasoning_short: short 1-2 lines\n\n"
+        "Rules:\n"
+        "- If chart is unclear, still give a CONDITIONAL setup (breakout/breakdown) and lower confidence.\n"
+        "- Use visible prices from chart when possible.\n"
+        "- Keep TP/SL realistic relative to entry.\n"
+        "- Do NOT mention policy, do NOT mention that you are an AI.\n"
+    )
+
+    url = "https://api.openai.com/v1/responses"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    r = requests.post(f"{OPENAI_BASE_URL}/responses", headers=headers, json=payload, timeout=60)
+    payload = {
+        "model": MODEL_VISION,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64jpeg}"}
+                ],
+            }
+        ],
+        "max_output_tokens": 500,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code >= 400:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
 
     data = r.json()
 
-    # Extract output text (Responses API)
+    # Extract text output
     out_text = ""
     for item in data.get("output", []):
-        if item.get("type") == "message":
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    out_text += c.get("text", "")
+        for c in item.get("content", []):
+            if c.get("type") in ("output_text", "text") and "text" in c:
+                out_text += c["text"]
+
     out_text = out_text.strip()
+    if not out_text:
+        raise RuntimeError("Empty OpenAI output")
 
-    # Try parse JSON
+    # Parse JSON strictly
     try:
-        result = json.loads(out_text)
-        if not isinstance(result, dict):
-            raise ValueError("Not dict JSON")
-        return result
+        parsed = json.loads(out_text)
     except Exception:
-        # fallback: return a conservative template if model output wasn't JSON
-        return {
-            "symbol": "UNKNOWN",
-            "timeframe": "UNKNOWN",
-            "market_state": "NEUTRAL",
-            "action": "WAIT",
-            "confidence": 35,
-            "entry_zone": "Conditional: BUY above recent high / SELL below recent low",
-            "tp1": "TP1: nearest resistance/support",
-            "tp2": "TP2: next major level",
-            "tp3": "TP3: extended target",
-            "sl": "SL: below/above swing level",
-            "caution": "Image unclear. Zoom candles + show price axis."
-        }
+        # try to salvage if model added extra text
+        m = re.search(r"\{.*\}", out_text, re.S)
+        if not m:
+            raise RuntimeError(f"Invalid JSON from model: {out_text[:300]}")
+        parsed = json.loads(m.group(0))
 
-# =========================================================
-# Formatting
-# =========================================================
-def fmt_signal(sig: Dict[str, Any], free_left: Optional[int] = None) -> str:
-    symbol = sig.get("symbol", "UNKNOWN")
-    tf = sig.get("timeframe", "UNKNOWN")
-    state = str(sig.get("market_state", "NEUTRAL")).upper()
-    action = str(sig.get("action", "WAIT")).upper()
-    conf = sig.get("confidence", 0)
+    # normalize
+    parsed.setdefault("market_state", "Neutral")
+    parsed.setdefault("signal", "BUY")
+    parsed.setdefault("confidence", 50)
+    parsed.setdefault("entry_zone", "N/A")
+    parsed.setdefault("tp1", "N/A")
+    parsed.setdefault("tp2", "N/A")
+    parsed.setdefault("tp3", "N/A")
+    parsed.setdefault("sl", "N/A")
+    parsed.setdefault("caution", "Use risk management.")
+    parsed.setdefault("reasoning_short", "")
 
-    entry = sig.get("entry_zone", "-")
-    tp1 = sig.get("tp1", "-")
-    tp2 = sig.get("tp2", "-")
-    tp3 = sig.get("tp3", "-")
-    sl = sig.get("sl", "-")
-    caution = sig.get("caution", "-")
+    # enforce types
+    try:
+        parsed["confidence"] = int(parsed["confidence"])
+    except Exception:
+        parsed["confidence"] = 50
+
+    sig = str(parsed.get("signal", "BUY")).upper()
+    parsed["signal"] = "BUY" if sig not in ("BUY", "SELL") else sig
+
+    ms = str(parsed.get("market_state", "Neutral")).capitalize()
+    if ms not in ("Bullish", "Bearish", "Neutral"):
+        ms = "Neutral"
+    parsed["market_state"] = ms
+
+    return parsed
+
+def format_signal_message(symbol_hint: str, timeframe_hint: str, result: dict, trial_line: str) -> str:
+    ms = result["market_state"]
+    sig = result["signal"]
+    conf = result["confidence"]
+    entry = result["entry_zone"]
+    tp1, tp2, tp3 = result["tp1"], result["tp2"], result["tp3"]
+    sl = result["sl"]
+    caution = result["caution"]
+    reason = result.get("reasoning_short", "")
 
     # Emojis
-    state_emoji = "📈" if state == "BULLISH" else "📉" if state == "BEARISH" else "➖"
-    action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "🟡"
+    ms_emoji = "📈" if ms == "Bullish" else ("📉" if ms == "Bearish" else "⏸️")
+    sig_emoji = "🟢" if sig == "BUY" else "🔴"
 
-    lines = []
-    lines.append(f"{action_emoji} **{action} | {symbol} | {tf} | {conf}%**")
-    lines.append(f"{state_emoji} **Market:** {state}")
-    lines.append("")
-    lines.append(f"🎯 **Entry Zone:** {entry}")
-    lines.append(f"✅ **TP1:** {tp1}")
-    lines.append(f"✅ **TP2:** {tp2}")
-    lines.append(f"✅ **TP3:** {tp3}")
-    lines.append(f"🛑 **SL:** {sl}")
-    lines.append("")
-    lines.append(f"⚠️ **Caution:** {caution}")
-    lines.append("")
-    lines.append("📚 _Educational only | Risk 1–2%_")
-
-    if free_left is not None:
-        lines.append("")
-        lines.append(f"🧪 **Free Trial:** {free_left}/{FREE_LIMIT} remaining.  Upgrade: /plans")
-
-    return "\n".join(lines)
-
-def plans_text() -> str:
-    return (
-        "💎 **Plans**\n\n"
-        "🧪 FREE: 5 chart analyses (by image) ثم يطلب الاشتراك.\n"
-        "🟦 LITE: إشارات أقل + تحليل صور.\n"
-        "🟪 PRO: إشارات قوية تلقائية (بدون صور) + تحليل صور.\n"
-        "🟨 VIP_GOLD: إشارات ذهب فقط تلقائية + تحليل صور.\n"
-        "🟥 VIP_ALL: إشارات جميع العملات والذهب تلقائية + تحليل صور.\n"
-        "⭐ VIP_PRO: أعلى أولوية وأقوى فلترة.\n\n"
-        "للتفعيل (Admin):\n"
-        "`/setplan <user_id> <plan> <days>`\n"
-        "مثال:\n"
-        "`/setplan 7269750900 VIP_ALL 365`"
-    )
-
-# =========================================================
-# Telegram Handlers
-# =========================================================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ensure_user(user_id)
-    p = get_effective_plan(user_id)
-    u = get_user(user_id)
-    free_used = int(u.get("free_used", 0))
-    free_left = max(0, FREE_LIMIT - free_used)
+    sym = symbol_hint or "SYMBOL"
+    tf = timeframe_hint or "TF"
 
     msg = (
-        "🤖 أهلاً! أنا **Trading AI**\n\n"
-        "📷 أرسل صورة الشارت وسأعطيك:\n"
-        "- Trend (صعود/هبوط/محايد)\n"
-        "- Entry Zone\n"
-        "- TP1 / TP2 / TP3\n"
-        "- SL\n"
-        "- Caution\n\n"
-        f"👤 **Your plan:** {p}\n"
-        f"🧪 **Free remaining:** {free_left}/{FREE_LIMIT}\n\n"
-        "ℹ️ /myid  |  💎 /plans"
+        f"{sig_emoji} **{sig} | {sym} | {tf} | {conf}%**\n"
+        f"{ms_emoji} Market: **{ms}**\n\n"
+        f"🎯 Entry Zone: **{entry}**\n"
+        f"✅ TP1: **{tp1}**\n"
+        f"✅ TP2: **{tp2}**\n"
+        f"✅ TP3: **{tp3}**\n"
+        f"🛑 SL: **{sl}**\n\n"
+        f"⚠️ Caution: {caution}\n"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    if reason:
+        msg += f"🧠 Note: {reason}\n"
+    if trial_line:
+        msg += f"\n{trial_line}\n"
+    msg += "\n📌 Educational only | Risk 1–2%"
+    return msg
+
+def guess_symbol_tf(caption: str) -> tuple[str, str]:
+    if not caption:
+        return "", ""
+    cap = caption.upper()
+    sym = ""
+    tf = ""
+    # naive guesses
+    for s in ["XAUUSD", "GOLD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]:
+        if s in cap:
+            sym = "XAUUSD" if s == "GOLD" else s
+            break
+    m = re.search(r"\b(M1|M5|M15|M30|H1|H4|D1)\b", cap)
+    if m:
+        tf = m.group(1)
+    return sym, tf
+
+# =========================
+# Telegram Handlers
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME_TEXT)
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"🆔 Your Telegram ID: `{user_id}`", parse_mode=ParseMode.MARKDOWN)
+    uid = update.effective_user.id
+    await update.message.reply_text(f"✅ Your ID: {uid}")
 
 async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(plans_text(), parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    u = get_user(user_id)
-    plan = get_effective_plan(user_id)
-    until = int(u.get("plan_until") or 0)
-    free_used = int(u.get("free_used") or 0)
-    free_left = max(0, FREE_LIMIT - free_used)
-
-    until_str = "-"
-    if plan != "FREE" and until > 0:
-        until_str = datetime.fromtimestamp(until, TZ).strftime("%Y-%m-%d %H:%M")
-
-    txt = (
-        f"👤 Plan: **{plan}**\n"
-        f"⏳ Until: **{until_str}**\n"
-        f"🧪 Free used: **{free_used}/{FREE_LIMIT}** (left {free_left})"
-    )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(PLANS_TEXT)
 
 async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if OWNER_ID and user_id != OWNER_ID:
+    uid = update.effective_user.id
+    if not is_admin(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not context.args or len(context.args) < 3:
-        await update.message.reply_text(
-            "Usage:\n`/setplan <user_id> <plan> <days>`\n"
-            f"plans: {', '.join(PLANS)}",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # Usage: /setplan <user_id> <plan> <days>
+    parts = (update.message.text or "").split()
+    if len(parts) != 4:
+        await update.message.reply_text("Usage: /setplan <user_id> <plan> <days>\nplans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO")
         return
 
-    try:
-        target_id = int(context.args[0])
-        plan = context.args[1].upper()
-        days = int(context.args[2])
-        set_plan(target_id, plan, days)
-        await update.message.reply_text(f"✅ Set {target_id} plan={plan} for {days} days")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    target_id = parts[1].strip()
+    plan = parts[2].strip().upper()
+    days = parts[3].strip()
 
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not target_id.isdigit():
+        await update.message.reply_text("❌ user_id must be numeric.")
+        return
+    if plan not in PLANS:
+        await update.message.reply_text("❌ Invalid plan.")
+        return
+    if not days.isdigit():
+        await update.message.reply_text("❌ days must be numeric.")
+        return
+
+    db = await load_db()
+    await set_plan(db, int(target_id), plan, int(days))
+    await update.message.reply_text(f"✅ Set {target_id} plan={plan} for {days} days")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
     user_id = update.effective_user.id
-    ensure_user(user_id)
-    plan = get_effective_plan(user_id)
 
-    # FREE limitation
-    u = get_user(user_id)
-    free_used = int(u.get("free_used", 0))
-    free_left = max(0, FREE_LIMIT - free_used)
+    db = await load_db()
+    u = await get_user(db, user_id)
 
-    if plan == "FREE" and free_left <= 0:
-        await update.message.reply_text(
-            "🔒 Free Trial انتهى.\n\nUpgrade: /plans",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    await update.message.reply_text("📸 Received. Analyzing...")
-
-    # Get largest photo
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    img_bytes = await file.download_as_bytearray()
-
-    try:
-        sig = await asyncio.to_thread(openai_analyze_chart, bytes(img_bytes))
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ Analysis failed.\n"
-            "جرّب صورة أوضح (Zoom candles) + أظهر الأسعار.\n\n"
-            f"Error: `{str(e)[:300]}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    # decrement free
-    if plan == "FREE":
-        used = inc_free_used(user_id)
-        free_left = max(0, FREE_LIMIT - used)
-        msg = fmt_signal(sig, free_left=free_left)
+    # check plan/trial
+    if u.get("plan", "FREE") == "FREE":
+        rem = await trial_remaining(u)
+        if rem <= 0:
+            await msg.reply_text("🔒 انتهى Free Trial.\nاكتب /plans للاشتراك.")
+            return
     else:
-        msg = fmt_signal(sig, free_left=None)
+        if not plan_active(u):
+            # expired -> back to free
+            u["plan"] = "FREE"
+            u["expires_at"] = 0
+            await save_db(db)
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await msg.chat.send_action(ChatAction.TYPING)
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # For unknown text - friendly help
-    txt = (update.message.text or "").strip().lower()
-    if txt in ["/start", "start"]:
-        return
-    await update.message.reply_text("📷 أرسل صورة الشارت للتحليل.\n💎 /plans | 🆔 /myid")
+    # Download best photo size
+    photo = msg.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    b = await file.download_as_bytearray()
 
-# =========================================================
-# FastAPI (TradingView Webhook)
-# =========================================================
-app = FastAPI()
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "trading-ai-bot"}
-
-def parse_tv_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Expected payload sample:
-    {
-      "plan": "PRO" or "VIP_ALL" or "VIP_GOLD",
-      "symbol": "XAUUSD",
-      "timeframe": "M5",
-      "action": "BUY"/"SELL",
-      "entry_zone": "4440-4443",
-      "tp1": "...",
-      "tp2": "...",
-      "tp3": "...",
-      "sl": "...",
-      "confidence": 82,
-      "market_state": "BULLISH",
-      "caution": "news soon"
-    }
-    """
-    plan = str(payload.get("plan", "PRO")).upper()
-    symbol = str(payload.get("symbol", "UNKNOWN")).upper()
-    tf = str(payload.get("timeframe", "TF")).upper()
-
-    sig = {
-        "symbol": symbol,
-        "timeframe": tf,
-        "market_state": str(payload.get("market_state", "NEUTRAL")).upper(),
-        "action": str(payload.get("action", "WAIT")).upper(),
-        "confidence": int(payload.get("confidence", 70)),
-        "entry_zone": str(payload.get("entry_zone", "Use breakout above/below structure")),
-        "tp1": str(payload.get("tp1", "TP1")),
-        "tp2": str(payload.get("tp2", "TP2")),
-        "tp3": str(payload.get("tp3", "TP3")),
-        "sl": str(payload.get("sl", "SL")),
-        "caution": str(payload.get("caution", "Manage risk; avoid news spikes")),
-    }
-    return {"plan": plan, "sig": sig}
-
-def pick_channel(plan: str, symbol: str) -> int:
-    plan = plan.upper()
-    symbol = symbol.upper()
-
-    # VIP_GOLD -> gold channel if set
-    if plan == "VIP_GOLD":
-        return VIP_GOLD_CHANNEL_ID or VIP_CHANNEL_ID
-
-    # VIP_ALL / VIP_PRO -> VIP channel
-    if plan in ["VIP_ALL", "VIP_PRO"]:
-        return VIP_CHANNEL_ID
-
-    # PRO / LITE -> PRO channel
-    if plan in ["PRO", "LITE"]:
-        return PRO_CHANNEL_ID
-
-    # default
-    return PRO_CHANNEL_ID or VIP_CHANNEL_ID or 0
-
-@app.post("/tv_webhook")
-async def tv_webhook(request: Request):
-    # Optional security
-    if TV_WEBHOOK_SECRET:
-        got = request.headers.get("X-TV-SECRET", "").strip()
-        if got != TV_WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    caption = msg.caption or ""
+    sym_hint, tf_hint = guess_symbol_tf(caption)
 
     try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        b64 = image_to_base64_jpeg(bytes(b), max_side=1100, quality=85)
+        result = await asyncio.to_thread(openai_analyze_chart, b64)
 
-    parsed = parse_tv_payload(payload)
-    plan = parsed["plan"]
-    sig = parsed["sig"]
+        # decrement trial only on success
+        trial_line = ""
+        if u.get("plan", "FREE") == "FREE":
+            u["trial_used"] = int(u.get("trial_used", 0) or 0) + 1
+            await save_db(db)
+            rem_after = await trial_remaining(u)
+            trial_line = f"🧪 Free Trial remaining: {rem_after}/{FREE_TRIAL_LIMIT}\nUpgrade: /plans"
 
-    channel_id = pick_channel(plan, sig.get("symbol", "UNKNOWN"))
-    if not channel_id:
-        raise HTTPException(status_code=400, detail="Channel ID not configured")
+        text = format_signal_message(sym_hint, tf_hint, result, trial_line)
+        await msg.reply_text(text, parse_mode="Markdown")
 
-    text = fmt_signal(sig, free_left=None)
-    # Add "Auto Signal" label
-    text = "⚡ **AUTO SIGNAL**\n\n" + text
-
-    # Send via bot
-    if telegram_app is None:
-        raise HTTPException(status_code=500, detail="Telegram bot not ready")
-
-    try:
-        await telegram_app.bot.send_message(chat_id=channel_id, text=text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send: {e}")
+        # do not decrement trial
+        await msg.reply_text(
+            "❌ Analysis failed.\n"
+            "جرّب صورة أوضح ومقربة على الشموع (Zoom candles) + أظهر السعر والزوج والفريم.\n\n"
+            f"Debug: {str(e)[:300]}"
+        )
 
-    return JSONResponse({"ok": True, "sent_to": channel_id})
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If user sends random text, guide them
+    t = (update.message.text or "").strip()
+    if t.startswith("/"):
+        return
+    await update.message.reply_text("📌 أرسل صورة الشارت للتحليل.\nأوامر: /start /myid /plans")
 
-# =========================================================
-# Run Telegram in FastAPI lifecycle
-# =========================================================
-telegram_app: Optional[Application] = None
-
-async def start_telegram():
-    global telegram_app
+# =========================
+# Main
+# =========================
+async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not ADMIN_IDS:
+        print("WARNING: ADMIN_IDS is empty. /setplan will not work for anyone.")
 
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(CommandHandler("myid", cmd_myid))
-    telegram_app.add_handler(CommandHandler("plans", cmd_plans))
-    telegram_app.add_handler(CommandHandler("status", cmd_status))
-    telegram_app.add_handler(CommandHandler("setplan", cmd_setplan))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("plans", cmd_plans))
+    app.add_handler(CommandHandler("setplan", cmd_setplan))
 
-    telegram_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    print("✅ Bot starting (Polling)...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-async def stop_telegram():
-    global telegram_app
-    if telegram_app:
-        try:
-            await telegram_app.updater.stop()
-        except Exception:
-            pass
-        try:
-            await telegram_app.stop()
-        except Exception:
-            pass
-        try:
-            await telegram_app.shutdown()
-        except Exception:
-            pass
-        telegram_app = None
+    # Keep alive forever
+    while True:
+        await asyncio.sleep(3600)
 
-@app.on_event("startup")
-async def on_startup():
-    init_db()
-    # start telegram polling in background
-    asyncio.create_task(start_telegram())
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await stop_telegram()
+if __name__ == "__main__":
+    asyncio.run(main())
