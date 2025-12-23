@@ -1,10 +1,9 @@
-import os
+   import os
 import re
 import json
 import time
 import base64
 import asyncio
-from datetime import datetime, timedelta
 from io import BytesIO
 
 import requests
@@ -25,7 +24,6 @@ MODEL_VISION = os.getenv("MODEL_VISION", "gpt-4.1-mini").strip()
 FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5"))
 
 # --- TP rules (points -> price)
-# Default: 1 point = 0.01 price units (example: Gold style)
 POINT_VALUE = float(os.getenv("POINT_VALUE", "0.01"))  # 0.01 = 1 point
 CONF_STRONG = int(os.getenv("CONF_STRONG", "70"))
 
@@ -48,34 +46,32 @@ if _admin_raw:
         if x.isdigit():
             ADMIN_IDS.add(int(x))
 
-# Optional channel IDs (if you want broadcast later)
-PRO_CHANNEL_ID = os.getenv("PRO_CHANNEL_ID", "").strip()         # e.g. -1001234567890
-VIP_GOLD_CHANNEL_ID = os.getenv("VIP_GOLD_CHANNEL_ID", "").strip()
-VIP_ALL_CHANNEL_ID = os.getenv("VIP_ALL_CHANNEL_ID", "").strip()
-
 DB_FILE = "db.json"
 DB_LOCK = asyncio.Lock()
 
-PLANS = ["FREE", "LITE", "PRO", "VIP_GOLD", "VIP_ALL", "VIP_PRO"]
+# ✅ Plans: فقط Free + Paid (Lifetime)
+PLANS = ["FREE", "PAID"]  # PAID = $49 Lifetime
 
 WELCOME_TEXT = (
     "🤖 Trading AI Bot\n\n"
-    "📌 أرسل صورة الشارت (واضحة ومقربة على الشموع) وسأعطيك:\n"
+    "Send a CLEAR chart screenshot (zoom on candles) and you will get:\n"
     "• Market State (Bullish/Bearish/Neutral)\n"
-    "• Signal (Buy/Sell) + Entry Zone\n"
-    "• TP1/TP2/TP3 + SL\n"
-    "• Caution\n\n"
-    "🆓 Free Trial: 5 تحليلات صور للتجربة.\n"
-    "📌 أوامر:\n"
-    "/myid - عرض ID\n"
-    "/plans - خطط الاشتراك\n"
+    "• Signal (BUY/SELL) + Entry Zone\n"
+    "• TP1/TP2/TP3 + SL\n\n"
+    f"🆓 Free Trial: {FREE_TRIAL_LIMIT} image analyses.\n"
+    "💎 After trial: $49 Lifetime (one-time) — Unlimited photos & unlimited time.\n\n"
+    "Commands:\n"
+    "/myid - Show your ID\n"
+    "/plans - Subscription info\n"
 )
 
 PLANS_TEXT = (
-    "💎 Plans:\n"
-    "• FREE: 5 image analyses trial\n"
-    "• LITE / PRO / VIP_GOLD / VIP_ALL / VIP_PRO\n\n"
-    "للاشتراك تواصل مع الإدارة.\n"
+    "💎 Trading AI Subscription\n\n"
+    f"• FREE: {FREE_TRIAL_LIMIT} image analyses trial\n"
+    "• LIFETIME: $49 (one-time payment)\n"
+    "  - Unlimited photos\n"
+    "  - Unlimited time\n\n"
+    "To subscribe, contact support/admin.\n"
 )
 
 # =========================
@@ -87,7 +83,7 @@ def _now_ts() -> int:
 def _default_user():
     return {
         "plan": "FREE",
-        "expires_at": 0,
+        "expires_at": 0,   # not used for PAID
         "trial_used": 0,
         "created_at": _now_ts(),
     }
@@ -111,11 +107,11 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def plan_active(u: dict) -> bool:
-    p = u.get("plan", "FREE")
-    if p == "FREE":
-        return True
-    exp = int(u.get("expires_at", 0) or 0)
-    return exp > _now_ts()
+    p = (u.get("plan", "FREE") or "FREE").upper()
+    if p == "PAID":
+        return True  # Lifetime
+    # FREE is handled via trial counter
+    return True
 
 async def get_user(db: dict, user_id: int) -> dict:
     uid = str(user_id)
@@ -124,22 +120,19 @@ async def get_user(db: dict, user_id: int) -> dict:
         await save_db(db)
     return db["users"][uid]
 
-async def set_plan(db: dict, user_id: int, plan: str, days: int):
-    plan = plan.strip().upper()
+async def set_plan(db: dict, user_id: int, plan: str):
+    plan = (plan or "").strip().upper()
     if plan not in PLANS:
         raise ValueError("Invalid plan")
     u = await get_user(db, user_id)
     u["plan"] = plan
-    if plan == "FREE":
-        u["expires_at"] = 0
-    else:
-        u["expires_at"] = int((_now_ts() + days * 86400))
+    # Lifetime: no expiry needed
+    u["expires_at"] = 0
     await save_db(db)
 
 async def trial_remaining(u: dict) -> int:
     used = int(u.get("trial_used", 0) or 0)
-    rem = max(0, FREE_TRIAL_LIMIT - used)
-    return rem
+    return max(0, FREE_TRIAL_LIMIT - used)
 
 # =========================
 # TP enforcement helpers
@@ -152,9 +145,6 @@ def _extract_floats(text: str) -> list[float]:
     return [float(x) for x in _NUM_RE.findall(text)]
 
 def _detect_decimals(text: str, default: int = 1) -> int:
-    """
-    Detect decimals from a price-like string. If not found, return default.
-    """
     if not text:
         return default
     m = re.search(r"\d+\.(\d+)", text)
@@ -167,12 +157,6 @@ def _format_price(x: float, decimals: int) -> str:
     return fmt.format(x)
 
 def _parse_entry_anchor(entry_zone: str) -> float | None:
-    """
-    Anchor from entry_zone:
-    - "4477.0 - 4480.0" -> average
-    - "Breakout above 4438.0" -> 4438.0
-    - first number -> that
-    """
     nums = _extract_floats(entry_zone or "")
     if not nums:
         return None
@@ -183,8 +167,8 @@ def _parse_entry_anchor(entry_zone: str) -> float | None:
 def enforce_tp_rules(result: dict) -> dict:
     """
     ✅ Marketing rule:
-    - TP1 ثابت دائمًا (TP1_FIXED_POINTS)
-    - TP2/TP3 حسب confidence (weak/strong)
+    - TP1 fixed always
+    - TP2/TP3 based on confidence (weak/strong)
     """
     try:
         conf = int(result.get("confidence", 50) or 50)
@@ -194,7 +178,7 @@ def enforce_tp_rules(result: dict) -> dict:
     entry_zone = str(result.get("entry_zone", "") or "")
     anchor = _parse_entry_anchor(entry_zone)
     if anchor is None:
-        return result  # can't enforce without a numeric anchor
+        return result
 
     decimals = _detect_decimals(entry_zone, default=1)
 
@@ -204,7 +188,6 @@ def enforce_tp_rules(result: dict) -> dict:
 
     strong = conf >= CONF_STRONG
 
-    # ✅ TP1 ثابت
     p1 = TP1_FIXED_POINTS
     p2 = TP2_STRONG_POINTS if strong else TP2_WEAK_POINTS
     p3 = TP3_STRONG_POINTS if strong else TP3_WEAK_POINTS
@@ -232,9 +215,9 @@ def enforce_tp_rules(result: dict) -> dict:
 # =========================
 def confidence_profile(conf: int) -> tuple[str, str]:
     """
-    Returns:
+    Returns EN-only:
       market_label: Neutral / Mild momentum / Strong momentum
-      note: safe EN note (no promises)
+      note: safe note (no promises)
     """
     try:
         c = int(conf)
@@ -262,19 +245,15 @@ def confidence_profile(conf: int) -> tuple[str, str]:
     )
 
 def apply_confidence_messaging(result: dict) -> dict:
-    """
-    Forces EN-only messaging layer to avoid over-promising (e.g., 'High Extension').
-    """
     conf = int(result.get("confidence", 50) or 50)
     market_label, note = confidence_profile(conf)
 
-    # Store for formatter
     result["market_label"] = market_label
     result["note_en"] = note
 
-    # Optional: override any model-generated caution/reasoning (could be Arabic)
+    # Force EN clean output (avoid Arabic/over-promising from model)
     result["caution"] = "Educational only. Use risk management."
-    result["reasoning_short"] = ""  # keep clean
+    result["reasoning_short"] = ""
     return result
 
 # =========================
@@ -291,14 +270,6 @@ def image_to_base64_jpeg(image_bytes: bytes, max_side: int = 1024, quality: int 
     return base64.b64encode(out.getvalue()).decode("utf-8")
 
 def openai_analyze_chart(b64jpeg: str) -> dict:
-    """
-    Returns dict:
-    {
-      market_state, signal, confidence,
-      entry_zone, tp1,tp2,tp3, sl, caution,
-      reasoning_short
-    }
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
@@ -346,7 +317,6 @@ def openai_analyze_chart(b64jpeg: str) -> dict:
 
     data = r.json()
 
-    # Extract text output
     out_text = ""
     for item in data.get("output", []):
         for c in item.get("content", []):
@@ -357,17 +327,14 @@ def openai_analyze_chart(b64jpeg: str) -> dict:
     if not out_text:
         raise RuntimeError("Empty OpenAI output")
 
-    # Parse JSON strictly
     try:
         parsed = json.loads(out_text)
     except Exception:
-        # try to salvage if model added extra text
         m = re.search(r"\{.*\}", out_text, re.S)
         if not m:
             raise RuntimeError(f"Invalid JSON from model: {out_text[:300]}")
         parsed = json.loads(m.group(0))
 
-    # normalize
     parsed.setdefault("market_state", "Neutral")
     parsed.setdefault("signal", "BUY")
     parsed.setdefault("confidence", 50)
@@ -379,7 +346,6 @@ def openai_analyze_chart(b64jpeg: str) -> dict:
     parsed.setdefault("caution", "Use risk management.")
     parsed.setdefault("reasoning_short", "")
 
-    # enforce types
     try:
         parsed["confidence"] = int(parsed["confidence"])
     except Exception:
@@ -396,17 +362,16 @@ def openai_analyze_chart(b64jpeg: str) -> dict:
     return parsed
 
 def format_signal_message(symbol_hint: str, timeframe_hint: str, result: dict, trial_line: str) -> str:
-    ms = result["market_state"]              # Bullish/Bearish/Neutral
-    sig = result["signal"]                   # BUY/SELL
+    ms = result["market_state"]
+    sig = result["signal"]
     conf = result["confidence"]
     entry = result["entry_zone"]
     tp1, tp2, tp3 = result["tp1"], result["tp2"], result["tp3"]
     sl = result["sl"]
 
-    market_label = result.get("market_label", "Neutral")  # Neutral/Mild momentum/Strong momentum
+    market_label = result.get("market_label", "Neutral")
     note_en = result.get("note_en", "")
 
-    # Emojis
     state_emoji = "📈" if ms == "Bullish" else ("📉" if ms == "Bearish" else "⏸️")
     sig_emoji = "🟢" if sig == "BUY" else "🔴"
 
@@ -422,10 +387,8 @@ def format_signal_message(symbol_hint: str, timeframe_hint: str, result: dict, t
         f"✅ TP2: **{tp2}**\n"
         f"✅ TP3: **{tp3}**\n"
         f"🛑 SL: **{sl}**\n\n"
+        f"🧠 Note: {note_en}\n"
     )
-
-    if note_en:
-        msg += f"🧠 Note: {note_en}\n"
 
     if trial_line:
         msg += f"\n{trial_line}\n"
@@ -439,7 +402,6 @@ def guess_symbol_tf(caption: str) -> tuple[str, str]:
     cap = caption.upper()
     sym = ""
     tf = ""
-    # naive guesses
     for s in ["XAUUSD", "GOLD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]:
         if s in cap:
             sym = "XAUUSD" if s == "GOLD" else s
@@ -463,34 +425,34 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(PLANS_TEXT)
 
 async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin only:
+      /setplan <user_id> FREE
+      /setplan <user_id> PAID
+    """
     uid = update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    # Usage: /setplan <user_id> <plan> <days>
     parts = (update.message.text or "").split()
-    if len(parts) != 4:
-        await update.message.reply_text("Usage: /setplan <user_id> <plan> <days>\nplans: LITE, PRO, VIP_GOLD, VIP_ALL, VIP_PRO")
+    if len(parts) != 3:
+        await update.message.reply_text("Usage:\n/setplan <user_id> FREE\n/setplan <user_id> PAID")
         return
 
     target_id = parts[1].strip()
     plan = parts[2].strip().upper()
-    days = parts[3].strip()
 
     if not target_id.isdigit():
         await update.message.reply_text("❌ user_id must be numeric.")
         return
     if plan not in PLANS:
-        await update.message.reply_text("❌ Invalid plan.")
-        return
-    if not days.isdigit():
-        await update.message.reply_text("❌ days must be numeric.")
+        await update.message.reply_text("❌ Invalid plan. Use FREE or PAID.")
         return
 
     db = await load_db()
-    await set_plan(db, int(target_id), plan, int(days))
-    await update.message.reply_text(f"✅ Set {target_id} plan={plan} for {days} days")
+    await set_plan(db, int(target_id), plan)
+    await update.message.reply_text(f"✅ Set {target_id} plan={plan}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -499,15 +461,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = await load_db()
     u = await get_user(db, user_id)
 
-    # check plan/trial
-    if u.get("plan", "FREE") == "FREE":
+    plan = (u.get("plan", "FREE") or "FREE").upper()
+
+    # FREE: limited trial
+    if plan == "FREE":
         rem = await trial_remaining(u)
         if rem <= 0:
-            await msg.reply_text("🔒 انتهى Free Trial.\nاكتب /plans للاشتراك.")
+            await msg.reply_text("🔒 Free trial ended.\nType /plans to subscribe ($49 lifetime).")
             return
     else:
+        # PAID: always active
         if not plan_active(u):
-            # expired -> back to free
+            # Should not happen, but fallback
             u["plan"] = "FREE"
             u["expires_at"] = 0
             await save_db(db)
@@ -526,37 +491,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b64 = image_to_base64_jpeg(bytes(b), max_side=1100, quality=85)
         result = await asyncio.to_thread(openai_analyze_chart, b64)
 
-        # ✅ Enforce our TP rules: TP1 fixed always
+        # ✅ TP rules
         result = enforce_tp_rules(result)
 
-        # ✅ Apply EN-only confidence messaging (no over-promising)
+        # ✅ EN-only confidence messaging
         result = apply_confidence_messaging(result)
 
         # decrement trial only on success
         trial_line = ""
-        if u.get("plan", "FREE") == "FREE":
+        if plan == "FREE":
             u["trial_used"] = int(u.get("trial_used", 0) or 0) + 1
             await save_db(db)
             rem_after = await trial_remaining(u)
-            trial_line = f"🧪 Free Trial remaining: {rem_after}/{FREE_TRIAL_LIMIT}\nUpgrade: /plans"
+            trial_line = f"🧪 Free Trial remaining: {rem_after}/{FREE_TRIAL_LIMIT}\nSubscribe: /plans ($49 lifetime)"
 
         text = format_signal_message(sym_hint, tf_hint, result, trial_line)
         await msg.reply_text(text, parse_mode="Markdown")
 
     except Exception as e:
-        # do not decrement trial
         await msg.reply_text(
             "❌ Analysis failed.\n"
-            "جرّب صورة أوضح ومقربة على الشموع (Zoom candles) + أظهر السعر والزوج والفريم.\n\n"
+            "Try a clearer screenshot (zoom candles) and make sure price/symbol/TF are visible.\n\n"
             f"Debug: {str(e)[:300]}"
         )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # If user sends random text, guide them
     t = (update.message.text or "").strip()
     if t.startswith("/"):
         return
-    await update.message.reply_text("📌 أرسل صورة الشارت للتحليل.\nأوامر: /start /myid /plans")
+    await update.message.reply_text("📌 Send a chart screenshot for analysis.\nCommands: /start /myid /plans")
 
 # =========================
 # Main
@@ -582,7 +545,6 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    # Keep alive forever
     while True:
         await asyncio.sleep(3600)
 
