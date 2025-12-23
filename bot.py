@@ -24,6 +24,21 @@ MODEL_VISION = os.getenv("MODEL_VISION", "gpt-4.1-mini").strip()
 
 FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5"))
 
+# --- TP rules (points -> price)
+# Default: 1 point = 0.01 price units (example: Gold style)
+POINT_VALUE = float(os.getenv("POINT_VALUE", "0.01"))  # 0.01 = 1 point
+CONF_STRONG = int(os.getenv("CONF_STRONG", "70"))
+
+# ✅ TP1 ثابت دائمًا (Marketing rule)
+TP1_FIXED_POINTS = int(os.getenv("TP1_FIXED_POINTS", "200"))
+
+# TP2/TP3 weak vs strong
+TP2_WEAK_POINTS = int(os.getenv("TP2_WEAK_POINTS", "400"))
+TP3_WEAK_POINTS = int(os.getenv("TP3_WEAK_POINTS", "600"))
+
+TP2_STRONG_POINTS = int(os.getenv("TP2_STRONG_POINTS", "500"))
+TP3_STRONG_POINTS = int(os.getenv("TP3_STRONG_POINTS", "700"))
+
 # Admin IDs: "7269750900,123"
 ADMIN_IDS = set()
 _admin_raw = os.getenv("ADMIN_IDS", "").strip()
@@ -125,6 +140,92 @@ async def trial_remaining(u: dict) -> int:
     used = int(u.get("trial_used", 0) or 0)
     rem = max(0, FREE_TRIAL_LIMIT - used)
     return rem
+
+# =========================
+# TP enforcement helpers
+# =========================
+_NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
+
+def _extract_floats(text: str) -> list[float]:
+    if not text:
+        return []
+    return [float(x) for x in _NUM_RE.findall(text)]
+
+def _detect_decimals(text: str, default: int = 1) -> int:
+    """
+    Detect decimals from a price-like string. If not found, return default.
+    """
+    if not text:
+        return default
+    m = re.search(r"\d+\.(\d+)", text)
+    if m:
+        return min(4, max(0, len(m.group(1))))
+    return default
+
+def _format_price(x: float, decimals: int) -> str:
+    fmt = f"{{:.{decimals}f}}"
+    return fmt.format(x)
+
+def _parse_entry_anchor(entry_zone: str) -> float | None:
+    """
+    Anchor from entry_zone:
+    - "4477.0 - 4480.0" -> average
+    - "Breakout above 4438.0" -> 4438.0
+    - first number -> that
+    """
+    nums = _extract_floats(entry_zone or "")
+    if not nums:
+        return None
+    if len(nums) >= 2 and ("-" in (entry_zone or "") or "–" in (entry_zone or "")):
+        return (nums[0] + nums[1]) / 2.0
+    return nums[0]
+
+def enforce_tp_rules(result: dict) -> dict:
+    """
+    ✅ Marketing rule:
+    - TP1 ثابت دائمًا (TP1_FIXED_POINTS)
+    - TP2/TP3 حسب confidence (weak/strong)
+    """
+    try:
+        conf = int(result.get("confidence", 50) or 50)
+    except Exception:
+        conf = 50
+
+    entry_zone = str(result.get("entry_zone", "") or "")
+    anchor = _parse_entry_anchor(entry_zone)
+    if anchor is None:
+        return result  # can't enforce without a numeric anchor
+
+    decimals = _detect_decimals(entry_zone, default=1)
+
+    sig = str(result.get("signal", "BUY") or "BUY").upper()
+    if sig not in ("BUY", "SELL"):
+        sig = "BUY"
+
+    strong = conf >= CONF_STRONG
+
+    # ✅ TP1 ثابت
+    p1 = TP1_FIXED_POINTS
+    p2 = TP2_STRONG_POINTS if strong else TP2_WEAK_POINTS
+    p3 = TP3_STRONG_POINTS if strong else TP3_WEAK_POINTS
+
+    d1 = p1 * POINT_VALUE
+    d2 = p2 * POINT_VALUE
+    d3 = p3 * POINT_VALUE
+
+    if sig == "BUY":
+        tp1 = anchor + d1
+        tp2 = anchor + d2
+        tp3 = anchor + d3
+    else:
+        tp1 = anchor - d1
+        tp2 = anchor - d2
+        tp3 = anchor - d3
+
+    result["tp1"] = _format_price(tp1, decimals)
+    result["tp2"] = _format_price(tp2, decimals)
+    result["tp3"] = _format_price(tp3, decimals)
+    return result
 
 # =========================
 # OpenAI vision call (Responses API)
@@ -370,6 +471,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         b64 = image_to_base64_jpeg(bytes(b), max_side=1100, quality=85)
         result = await asyncio.to_thread(openai_analyze_chart, b64)
+
+        # ✅ Enforce our TP rules: TP1 ثابت دائمًا
+        result = enforce_tp_rules(result)
 
         # decrement trial only on success
         trial_line = ""
