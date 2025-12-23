@@ -228,6 +228,56 @@ def enforce_tp_rules(result: dict) -> dict:
     return result
 
 # =========================
+# Confidence Messaging (EN only)
+# =========================
+def confidence_profile(conf: int) -> tuple[str, str]:
+    """
+    Returns:
+      market_label: Neutral / Mild momentum / Strong momentum
+      note: safe EN note (no promises)
+    """
+    try:
+        c = int(conf)
+    except Exception:
+        c = 50
+
+    if c >= 80:
+        return (
+            "Strong momentum",
+            "Price is approaching potential exhaustion. Quick targets recommended."
+        )
+    if 70 <= c < 80:
+        return (
+            "Mild momentum",
+            "Trend is active. Watch price reaction near key levels."
+        )
+    if 60 <= c < 70:
+        return (
+            "Neutral",
+            "Structure is forming. Momentum is building. Partial profits recommended."
+        )
+    return (
+        "Low conviction",
+        "Low clarity. Wait for confirmation and manage risk carefully."
+    )
+
+def apply_confidence_messaging(result: dict) -> dict:
+    """
+    Forces EN-only messaging layer to avoid over-promising (e.g., 'High Extension').
+    """
+    conf = int(result.get("confidence", 50) or 50)
+    market_label, note = confidence_profile(conf)
+
+    # Store for formatter
+    result["market_label"] = market_label
+    result["note_en"] = note
+
+    # Optional: override any model-generated caution/reasoning (could be Arabic)
+    result["caution"] = "Educational only. Use risk management."
+    result["reasoning_short"] = ""  # keep clean
+    return result
+
+# =========================
 # OpenAI vision call (Responses API)
 # =========================
 def image_to_base64_jpeg(image_bytes: bytes, max_side: int = 1024, quality: int = 85) -> str:
@@ -346,17 +396,18 @@ def openai_analyze_chart(b64jpeg: str) -> dict:
     return parsed
 
 def format_signal_message(symbol_hint: str, timeframe_hint: str, result: dict, trial_line: str) -> str:
-    ms = result["market_state"]
-    sig = result["signal"]
+    ms = result["market_state"]              # Bullish/Bearish/Neutral
+    sig = result["signal"]                   # BUY/SELL
     conf = result["confidence"]
     entry = result["entry_zone"]
     tp1, tp2, tp3 = result["tp1"], result["tp2"], result["tp3"]
     sl = result["sl"]
-    caution = result["caution"]
-    reason = result.get("reasoning_short", "")
+
+    market_label = result.get("market_label", "Neutral")  # Neutral/Mild momentum/Strong momentum
+    note_en = result.get("note_en", "")
 
     # Emojis
-    ms_emoji = "📈" if ms == "Bullish" else ("📉" if ms == "Bearish" else "⏸️")
+    state_emoji = "📈" if ms == "Bullish" else ("📉" if ms == "Bearish" else "⏸️")
     sig_emoji = "🟢" if sig == "BUY" else "🔴"
 
     sym = symbol_hint or "SYMBOL"
@@ -364,18 +415,21 @@ def format_signal_message(symbol_hint: str, timeframe_hint: str, result: dict, t
 
     msg = (
         f"{sig_emoji} **{sig} | {sym} | {tf} | {conf}%**\n"
-        f"{ms_emoji} Market: **{ms}**\n\n"
+        f"{state_emoji} Market State: **{ms}**\n"
+        f"🧭 Market: **{market_label}**\n\n"
         f"🎯 Entry Zone: **{entry}**\n"
         f"✅ TP1: **{tp1}**\n"
         f"✅ TP2: **{tp2}**\n"
         f"✅ TP3: **{tp3}**\n"
         f"🛑 SL: **{sl}**\n\n"
-        f"⚠️ Caution: {caution}\n"
     )
-    if reason:
-        msg += f"🧠 Note: {reason}\n"
+
+    if note_en:
+        msg += f"🧠 Note: {note_en}\n"
+
     if trial_line:
         msg += f"\n{trial_line}\n"
+
     msg += "\n📌 Educational only | Risk 1–2%"
     return msg
 
@@ -472,8 +526,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b64 = image_to_base64_jpeg(bytes(b), max_side=1100, quality=85)
         result = await asyncio.to_thread(openai_analyze_chart, b64)
 
-        # ✅ Enforce our TP rules: TP1 ثابت دائمًا
+        # ✅ Enforce our TP rules: TP1 fixed always
         result = enforce_tp_rules(result)
+
+        # ✅ Apply EN-only confidence messaging (no over-promising)
+        result = apply_confidence_messaging(result)
 
         # decrement trial only on success
         trial_line = ""
