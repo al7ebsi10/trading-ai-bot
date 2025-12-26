@@ -8,10 +8,11 @@ from io import BytesIO
 
 import requests
 from PIL import Image
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
 # =========================
@@ -52,26 +53,58 @@ DB_LOCK = asyncio.Lock()
 # ✅ Plans: ONLY FREE + PAID (Lifetime)
 PLANS = ["FREE", "PAID"]  # PAID = $49 Lifetime
 
-WELCOME_TEXT = (
-    "🤖 Trading AI Bot\n\n"
+# =========================
+# Marketing + Gumroad (HTML)
+# =========================
+GUMROAD_URL = "https://6864159013627.gumroad.com/l/vrjql"
+ADMIN_EMAIL = "Al7ebsi17@gmail.com"  # مرجعي فقط
+
+OFFER_TEXT_HTML = (
+    "🔥 <b>LIMITED OFFER</b> 🔥\n\n"
+    "💎 Trading AI – <b>ULTIMATE</b> (Lifetime)\n"
+    "<s>$149</s> ➜ <b>$49</b>\n\n"
+    "✅ Unlimited image analysis\n"
+    "✅ Unlimited signals\n"
+    "✅ Priority support\n\n"
+    "━━━━━━━━━━━━\n\n"
+    "🔥 <b>عرض محدود</b> 🔥\n\n"
+    "💎 Trading AI – <b>ULTIMATE</b> (مدى الحياة)\n"
+    "<s>149$</s> ➜ <b>49$</b>\n\n"
+    "✅ تحليل غير محدود\n"
+    "✅ إشارات غير محدودة\n"
+    "✅ دعم أولوية\n\n"
+    "⬇️ اضغط للاشتراك 👇"
+)
+
+def offer_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Subscribe – $49 (ULTIMATE)", url=GUMROAD_URL)],
+        [InlineKeyboardButton("✅ I Paid / Activate", callback_data="paid_activate")]
+    ])
+
+# Pending email step (no webhook)
+PENDING_EMAIL = {}  # user_id -> True
+
+WELCOME_TEXT_HTML = (
+    "🤖 <b>Trading AI Bot</b>\n\n"
     "Send a CLEAR chart screenshot (zoom on candles) and you will get:\n"
     "• Market State (Bullish/Bearish/Neutral)\n"
     "• Signal (BUY/SELL) + Entry Zone\n"
     "• TP1/TP2/TP3 + SL\n\n"
-    f"🆓 Free Trial: {FREE_TRIAL_LIMIT} image analyses.\n"
-    "💎 After trial: $49 Lifetime (one-time) — Unlimited photos & unlimited time.\n\n"
-    "Commands:\n"
+    f"🆓 Free Trial: <b>{FREE_TRIAL_LIMIT}</b> image analyses.\n\n"
+    + OFFER_TEXT_HTML +
+    "\n\nCommands:\n"
     "/myid - Show your ID\n"
     "/plans - Subscription info\n"
 )
 
-PLANS_TEXT = (
-    "💎 Trading AI Subscription\n\n"
-    f"• FREE: {FREE_TRIAL_LIMIT} image analyses trial\n"
-    "• LIFETIME: $49 (one-time payment)\n"
+PLANS_TEXT_HTML = (
+    "💎 <b>Trading AI Subscription</b>\n\n"
+    f"• FREE: <b>{FREE_TRIAL_LIMIT}</b> image analyses trial\n"
+    "• ULTIMATE (LIFETIME): <s>$149</s> ➜ <b>$49</b>\n"
     "  - Unlimited photos\n"
     "  - Unlimited time\n\n"
-    "To subscribe, contact support/admin.\n"
+    "⬇️ Subscribe here 👇"
 )
 
 # =========================
@@ -397,14 +430,22 @@ def guess_symbol_tf(caption):
 # Telegram Handlers
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME_TEXT)
+    await update.message.reply_text(
+        WELCOME_TEXT_HTML,
+        parse_mode="HTML",
+        reply_markup=offer_keyboard()
+    )
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text("✅ Your ID: {}".format(uid))
 
 async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(PLANS_TEXT)
+    await update.message.reply_text(
+        PLANS_TEXT_HTML,
+        parse_mode="HTML",
+        reply_markup=offer_keyboard()
+    )
 
 async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -436,6 +477,17 @@ async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_plan(db, int(target_id), plan)
     await update.message.reply_text("✅ Set {} plan={}".format(target_id, plan))
 
+async def paid_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    PENDING_EMAIL[uid] = True
+
+    await query.message.reply_text(
+        "✉️ Please send the email you used for Gumroad payment.\n\n"
+        "اكتب الإيميل اللي استخدمته في الدفع."
+    )
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = update.effective_user.id
@@ -448,7 +500,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if plan == "FREE":
         rem = await trial_remaining(u)
         if rem <= 0:
-            await msg.reply_text("🔒 Free trial ended.\nType /plans to subscribe ($49 lifetime).")
+            await msg.reply_text(
+                "🔒 <b>Free trial ended.</b>\n\n" + OFFER_TEXT_HTML,
+                parse_mode="HTML",
+                reply_markup=offer_keyboard()
+            )
             return
 
     await msg.chat.send_action(ChatAction.TYPING)
@@ -490,8 +546,52 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = (update.message.text or "").strip()
+    uid = update.effective_user.id
+
+    # If waiting for payment email
+    if uid in PENDING_EMAIL:
+        if "@" not in t or "." not in t:
+            await update.message.reply_text("❌ Please send a valid email address.")
+            return
+
+        del PENDING_EMAIL[uid]
+
+        username = update.effective_user.username or "NoUsername"
+        cmd_ready = f"/setplan {uid} PAID"
+
+        msg_admin = (
+            "💰 Payment Request\n\n"
+            f"👤 User: @{username}\n"
+            f"🆔 ID: {uid}\n"
+            f"📧 Email: {t}\n\n"
+            "✅ Verify in Gumroad → Sales (search by email)\n\n"
+            f"⚡ Activate command (copy/paste):\n{cmd_ready}\n\n"
+            f"(Admin email ref: {ADMIN_EMAIL})"
+        )
+
+        if not ADMIN_IDS:
+            await update.message.reply_text(
+                "⚠️ Admin not configured.\n"
+                "Please set ADMIN_IDS in server env."
+            )
+            return
+
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=msg_admin)
+            except Exception:
+                pass
+
+        await update.message.reply_text(
+            "✅ Thanks! We received your email.\n"
+            "Your subscription will be activated after verification."
+        )
+        return
+
+    # Ignore commands here
     if t.startswith("/"):
         return
+
     await update.message.reply_text("📌 Send a chart screenshot for analysis.\nCommands: /start /myid /plans")
 
 # =========================
@@ -501,7 +601,7 @@ async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     if not ADMIN_IDS:
-        print("WARNING: ADMIN_IDS is empty. /setplan will not work for anyone.")
+        print("WARNING: ADMIN_IDS is empty. /setplan will not work for anyone and payment requests won't reach you.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -509,6 +609,9 @@ async def main():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("plans", cmd_plans))
     app.add_handler(CommandHandler("setplan", cmd_setplan))
+
+    # Button callback for "I Paid / Activate"
+    app.add_handler(CallbackQueryHandler(paid_activate, pattern="^paid_activate$"))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
