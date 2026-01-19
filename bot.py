@@ -8,17 +8,16 @@ from io import BytesIO
 
 import requests
 from PIL import Image
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
-# =========================
-# Config
-# =========================
+# ============================================================
+# CONFIG
+# ============================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL_VISION = os.getenv("MODEL_VISION", "gpt-4.1-mini").strip()
@@ -52,209 +51,231 @@ DB_FILE = "db.json"
 DB_LOCK = asyncio.Lock()
 
 # ✅ Plans: ONLY FREE + PAID (Lifetime)
-PLANS = ["FREE", "PAID"]  # PAID = $49 Lifetime
+PLANS = ["FREE", "PAID"]  # PAID = Lifetime
 
-# =========================
-# Marketing + Gumroad (HTML)
-# =========================
-GUMROAD_URL = "https://6864159013627.gumroad.com/l/vrjql"
-ADMIN_EMAIL = "Al7ebsi17@gmail.com"  # مرجعي فقط
+# ============================================================
+# Marketing + Gumroad
+# ============================================================
+GUMROAD_URL = os.getenv("GUMROAD_URL", "https://6864159013627.gumroad.com/l/vrjql").strip()
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "Al7ebsi17@gmail.com").strip()  # مرجعي فقط
 
-OFFER_TEXT_HTML = (
-    "🔥 <b>LIMITED OFFER</b> 🔥\n\n"
-    "💎 Trading AI – <b>ULTIMATE</b> (Lifetime)\n"
-    "<s>$149</s> ➜ <b>$49</b>\n\n"
-    "✅ Unlimited image analysis\n"
-    "✅ Unlimited signals\n"
-    "✅ Priority support\n\n"
-    "━━━━━━━━━━━━\n\n"
-    "🔥 <b>عرض محدود</b> 🔥\n\n"
-    "💎 Trading AI – <b>ULTIMATE</b> (مدى الحياة)\n"
-    "<s>149$</s> ➜ <b>49$</b>\n\n"
-    "✅ تحليل غير محدود\n"
-    "✅ إشارات غير محدودة\n"
-    "✅ دعم أولوية\n\n"
-    "⬇️ اضغط للاشتراك 👇"
-)
+# ============================================================
+# I18N (AR / EN / FR)
+# ============================================================
+LANGS = {"en": "English", "ar": "العربية", "fr": "Français"}
 
-def offer_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Subscribe – $49 (ULTIMATE)", url=GUMROAD_URL)],
-        [InlineKeyboardButton("✅ I Paid / Activate", callback_data="paid_activate")]
-    ])
-
-# Pending email step (no webhook)
-PENDING_EMAIL = {}  # user_id -> True
-
-# =========================
-# Language / UI
-# =========================
-LANGS = ["en", "ar", "fr"]
-
-UI = {
+T = {
     "en": {
         "choose_lang": "🌍 Please choose your language:",
         "lang_set": "✅ Language set to English.",
-        "menu_title": "Choose an option:",
-        "btn_analyze": "📸 Analyze Chart",
-        "btn_plans": "💳 Subscribe / Plans",
-        "btn_help": "❓ Help",
-        "btn_lang": "🌐 Language",
-        "send_chart_only": "📸 Please send a clear chart screenshot now (zoom on candles).",
-        "analyzing": "🔍 Analyzing…",
-        "trial_remaining": "🧪 Free Trial remaining: {rem}/{limit}\nSubscribe: /plans ($49 lifetime)",
-        "trial_ended": "🔒 <b>Free trial ended.</b>\n\n",
-        "edu": "📌 Educational only | Risk 1–2%",
-        "need_lang": "Please choose your language first:",
-        "send_email": "✉️ Please send the email you used for Gumroad payment.",
-        "invalid_email": "❌ Please send a valid email address.",
-        "email_received": "✅ Thanks! We received your email.\nYour subscription will be activated after verification.",
-        "admin_missing": "⚠️ Admin not configured.\nPlease set ADMIN_IDS in server env.",
-        "help_text_html": (
-            "❓ <b>Help</b>\n\n"
-            "1) Choose your language\n"
-            "2) Press Analyze (optional) or just send a chart screenshot\n"
-            "3) You will receive: Signal + Entry + TP1/TP2/TP3 + SL\n\n"
-            "Tip: Zoom on candles and make sure prices are visible."
+        "welcome_title": "🤖 Trading AI Bot",
+        "welcome_body": (
+            "Send a CLEAR chart screenshot (zoom on candles).\n"
+            "You will receive:\n"
+            "• Market State (Bullish/Bearish/Neutral)\n"
+            "• Signal (BUY/SELL) + Entry Zone\n"
+            "• TP1/TP2/TP3 + SL\n"
         ),
-        "plans_text_html": (
-            "💎 <b>Trading AI Subscription</b>\n\n"
-            f"• FREE: <b>{FREE_TRIAL_LIMIT}</b> image analyses trial\n"
-            "• ULTIMATE (LIFETIME): <s>$149</s> ➜ <b>$49</b>\n"
-            "  - Unlimited photos\n"
-            "  - Unlimited time\n\n"
-            "⬇️ Subscribe here 👇"
+        "free_trial": "🧪 Free Trial: {n} analyses",
+        "menu_analyze": "📸 Analyze Chart",
+        "menu_plans": "💳 Subscribe / Plans",
+        "menu_help": "❓ Help",
+        "menu_lang": "🌐 Language",
+        "send_chart_now": "📸 Please send a clear chart screenshot now.\nTip: Ensure SYMBOL + TF are visible on the chart.",
+        "help_text": (
+            "✅ How to use:\n"
+            "1) Press 📸 Analyze Chart\n"
+            "2) Send a clear chart screenshot (zoom candles)\n"
+            "3) Get entry + TP/SL instantly\n\n"
+            "Notes:\n"
+            "• Best results when price scale, symbol, timeframe are visible.\n"
         ),
+        "plans_title": "💎 Trading AI — ULTIMATE (Lifetime)",
+        "plans_body": (
+            "✅ Unlimited analyses\n"
+            "✅ Unlimited signals\n"
+            "✅ Priority support\n\n"
+            "🔥 LIMITED OFFER: $49 (was $149)\n"
+        ),
+        "btn_subscribe": "💳 Subscribe — $49 (ULTIMATE)",
+        "btn_paid": "✅ I Paid / Activate",
+        "activate_ask_email": "✉️ Please send the email you used for Gumroad payment.\n\n(Or press Cancel)",
+        "btn_cancel": "✖️ Cancel",
+        "activate_cancelled": "✅ Activation cancelled.",
+        "invalid_email": "❌ Please send a valid email address (example: name@gmail.com).",
+        "thanks_email": "✅ Thanks! We received your email.\nYour subscription will be activated after verification.",
+        "trial_ended": "🔒 Free trial ended.\nSubscribe to unlock unlimited analysis.",
+        "admin_only": "⛔ Admin only.",
+        "setplan_usage": "Usage:\n/setplan <user_id> FREE\n/setplan <user_id> PAID",
+        "setplan_ok": "✅ Set {uid} plan={plan}",
+        "analysis_failed": "❌ Analysis failed.\nTry a clearer screenshot (zoom candles) and make sure price/symbol/TF are visible.",
+        "header": "━━━━━━━━━━━━━━━━\n🤖 Trading AI — Signal\n━━━━━━━━━━━━━━━━",
         "market_state": "Market State",
         "market": "Market",
         "entry": "Entry Zone",
-        "note": "Note",
-        "tp": "TP",
         "sl": "SL",
+        "note": "Note",
+        "educational": "📌 Educational only | Risk 1–2%",
+        "trial_remaining": "🧪 Free Trial remaining: {rem}/{tot}",
+        "subscribe_hint": "Subscribe: /plans ($49 lifetime)",
+        "legal_note": "Momentum supports the setup, but market conditions may change quickly. Manage risk accordingly.",
+        "signal_buy": "BUY",
+        "signal_sell": "SELL",
+        "bullish": "Bullish",
+        "bearish": "Bearish",
+        "neutral": "Neutral",
+        "strong_mom": "Strong momentum",
+        "mild_mom": "Mild momentum",
+        "neutral_mom": "Neutral",
+        "low_conv": "Low conviction",
     },
     "ar": {
-        "choose_lang": "🌍 يرجى اختيار لغتك:",
+        "choose_lang": "🌍 اختر لغتك:",
         "lang_set": "✅ تم ضبط اللغة على العربية.",
-        "menu_title": "اختر خيارًا:",
-        "btn_analyze": "📸 تحليل صورة شارت",
-        "btn_plans": "💳 الاشتراك / الخطط",
-        "btn_help": "❓ مساعدة",
-        "btn_lang": "🌐 تغيير اللغة",
-        "send_chart_only": "📸 أرسل صورة الشارت الآن بشكل واضح (قرّب الشموع).",
-        "analyzing": "🔍 جاري التحليل…",
-        "trial_remaining": "🧪 المتبقي من التجربة: {rem}/{limit}\nللاشتراك: /plans (49$ مدى الحياة)",
-        "trial_ended": "🔒 <b>انتهت التجربة المجانية.</b>\n\n",
-        "edu": "📌 تعليمي فقط | مخاطرة 1–2%",
-        "need_lang": "اختر اللغة أولاً:",
-        "send_email": "✉️ اكتب الإيميل الذي استخدمته في الدفع عبر Gumroad.",
-        "invalid_email": "❌ الرجاء إرسال بريد إلكتروني صحيح.",
-        "email_received": "✅ شكرًا! تم استلام الإيميل.\nسيتم تفعيل اشتراكك بعد التحقق.",
-        "admin_missing": "⚠️ لم يتم إعداد المدير.\nالرجاء ضبط ADMIN_IDS في السيرفر.",
-        "help_text_html": (
-            "❓ <b>مساعدة</b>\n\n"
-            "1) اختر اللغة\n"
-            "2) اضغط (تحليل صورة شارت) أو فقط أرسل صورة الشارت\n"
-            "3) ستحصل على: توصية + دخول + TP1/TP2/TP3 + SL\n\n"
-            "نصيحة: قرّب الشموع وتأكد أن الأسعار واضحة."
+        "welcome_title": "🤖 Trading AI Bot",
+        "welcome_body": (
+            "أرسل صورة شارت واضحة (قرّب الشموع).\n"
+            "ستحصل على:\n"
+            "• حالة السوق (صاعد/هابط/محايد)\n"
+            "• توصية (شراء/بيع) + منطقة دخول\n"
+            "• أهداف TP1/TP2/TP3 + وقف خسارة SL\n"
         ),
-        "plans_text_html": (
-            "💎 <b>اشتراك Trading AI</b>\n\n"
-            f"• مجاني: <b>{FREE_TRIAL_LIMIT}</b> تحليلات تجريبية\n"
-            "• ULTIMATE (مدى الحياة): <s>149$</s> ➜ <b>49$</b>\n"
-            "  - صور غير محدودة\n"
-            "  - بدون مدة زمنية\n\n"
-            "⬇️ اضغط للاشتراك 👇"
+        "free_trial": "🧪 التجربة المجانية: {n} تحليلات",
+        "menu_analyze": "📸 تحليل صورة شارت",
+        "menu_plans": "💳 الاشتراك / الخطط",
+        "menu_help": "❓ مساعدة",
+        "menu_lang": "🌐 تغيير اللغة",
+        "send_chart_now": "📸 أرسل الآن صورة شارت واضحة للتحليل.\nنصيحة: تأكد أن اسم الزوج + الفريم ظاهرين على الشارت.",
+        "help_text": (
+            "✅ طريقة الاستخدام:\n"
+            "1) اضغط 📸 تحليل صورة شارت\n"
+            "2) أرسل صورة شارت واضحة (قرّب الشموع)\n"
+            "3) تحصل على دخول + TP/SL فورًا\n\n"
+            "ملاحظات:\n"
+            "• أفضل نتيجة عندما يكون السعر واسم الزوج والفريم ظاهرين.\n"
         ),
+        "plans_title": "💎 Trading AI — ULTIMATE (مدى الحياة)",
+        "plans_body": (
+            "✅ تحليلات غير محدودة\n"
+            "✅ إشارات غير محدودة\n"
+            "✅ دعم أولوية\n\n"
+            "🔥 عرض محدود: 49$ (بدلاً من 149$)\n"
+        ),
+        "btn_subscribe": "💳 اشتراك — 49$ (ULTIMATE)",
+        "btn_paid": "✅ دفعت / تفعيل",
+        "activate_ask_email": "✉️ اكتب الإيميل الذي استخدمته في الدفع عبر Gumroad.\n\n(أو اضغط إلغاء)",
+        "btn_cancel": "✖️ إلغاء",
+        "activate_cancelled": "✅ تم إلغاء التفعيل.",
+        "invalid_email": "❌ اكتب بريد إلكتروني صحيح (مثال: name@gmail.com).",
+        "thanks_email": "✅ شكرًا! تم استلام الإيميل.\nسيتم تفعيل اشتراكك بعد التحقق.",
+        "trial_ended": "🔒 انتهت التجربة المجانية.\nاشترك لفتح التحليل غير المحدود.",
+        "admin_only": "⛔ للأدمن فقط.",
+        "setplan_usage": "الاستخدام:\n/setplan <user_id> FREE\n/setplan <user_id> PAID",
+        "setplan_ok": "✅ تم ضبط {uid} على خطة {plan}",
+        "analysis_failed": "❌ فشل التحليل.\nجرّب صورة أوضح (قرّب الشموع) وتأكد أن السعر/الزوج/الفريم ظاهرين.",
+        "header": "━━━━━━━━━━━━━━━━\n🤖 Trading AI — Signal\n━━━━━━━━━━━━━━━━",
         "market_state": "حالة السوق",
         "market": "السوق",
         "entry": "منطقة الدخول",
+        "sl": "وقف الخسارة",
         "note": "ملاحظة",
-        "tp": "هدف",
-        "sl": "وقف",
+        "educational": "📌 لأغراض تعليمية فقط | مخاطرة 1–2%",
+        "trial_remaining": "🧪 المتبقي من التجربة: {rem}/{tot}",
+        "subscribe_hint": "للاشتراك: /plans (49$ مدى الحياة)",
+        "legal_note": "الزخم يدعم هذا السيناريو، لكن السوق قد يتغير بسرعة. إدارة المخاطر ضرورية.",
+        "signal_buy": "شراء",
+        "signal_sell": "بيع",
+        "bullish": "صاعد",
+        "bearish": "هابط",
+        "neutral": "محايد",
+        "strong_mom": "زخم قوي",
+        "mild_mom": "زخم متوسط",
+        "neutral_mom": "محايد",
+        "low_conv": "وضوح منخفض",
     },
     "fr": {
         "choose_lang": "🌍 Veuillez choisir votre langue :",
-        "lang_set": "✅ Langue définie sur le Français.",
-        "menu_title": "Choisissez une option :",
-        "btn_analyze": "📸 Analyser le graphique",
-        "btn_plans": "💳 Abonnement / Offres",
-        "btn_help": "❓ Aide",
-        "btn_lang": "🌐 Langue",
-        "send_chart_only": "📸 Envoyez maintenant une capture claire (zoom bougies).",
-        "analyzing": "🔍 Analyse…",
-        "trial_remaining": "🧪 Essai restant: {rem}/{limit}\nAbonnement: /plans (49$ à vie)",
-        "trial_ended": "🔒 <b>Essai gratuit terminé.</b>\n\n",
-        "edu": "📌 Éducatif seulement | Risque 1–2%",
-        "need_lang": "Veuillez choisir la langue d’abord :",
-        "send_email": "✉️ Envoyez l’email utilisé pour le paiement Gumroad.",
-        "invalid_email": "❌ Veuillez envoyer un email valide.",
-        "email_received": "✅ Merci ! Email reçu.\nActivation après vérification.",
-        "admin_missing": "⚠️ Admin non configuré.\nVeuillez définir ADMIN_IDS.",
-        "help_text_html": (
-            "❓ <b>Aide</b>\n\n"
-            "1) Choisir la langue\n"
-            "2) Appuyer sur Analyser (optionnel) ou envoyer directement une capture\n"
-            "3) Vous recevrez : Signal + Entrée + TP1/TP2/TP3 + SL\n\n"
-            "Astuce : Zoom sur les bougies et assurez-vous que les prix sont visibles."
+        "lang_set": "✅ Langue définie sur Français.",
+        "welcome_title": "🤖 Trading AI Bot",
+        "welcome_body": (
+            "Envoyez une capture d’écran claire du graphique (zoomez sur les bougies).\n"
+            "Vous recevrez :\n"
+            "• État du marché (Haussier/Baissier/Neutre)\n"
+            "• Signal (ACHAT/VENTE) + Zone d’entrée\n"
+            "• TP1/TP2/TP3 + SL\n"
         ),
-        "plans_text_html": (
-            "💎 <b>Abonnement Trading AI</b>\n\n"
-            f"• GRATUIT : <b>{FREE_TRIAL_LIMIT}</b> analyses d’essai\n"
-            "• ULTIMATE (À VIE): <s>$149</s> ➜ <b>$49</b>\n"
-            "  - Photos illimitées\n"
-            "  - Accès illimité\n\n"
-            "⬇️ Abonnez-vous ici 👇"
+        "free_trial": "🧪 Essai gratuit : {n} analyses",
+        "menu_analyze": "📸 Analyser le graphique",
+        "menu_plans": "💳 Abonnement / Offres",
+        "menu_help": "❓ Aide",
+        "menu_lang": "🌐 Langue",
+        "send_chart_now": "📸 Envoyez maintenant une capture claire du graphique.\nAstuce : Assurez-vous que le symbole + TF sont visibles.",
+        "help_text": (
+            "✅ Comment utiliser :\n"
+            "1) Appuyez sur 📸 Analyser le graphique\n"
+            "2) Envoyez une capture claire (zoomez sur les bougies)\n"
+            "3) Recevez Entrée + TP/SL instantanément\n\n"
+            "Notes :\n"
+            "• Meilleurs résultats si prix, symbole et timeframe sont visibles.\n"
         ),
+        "plans_title": "💎 Trading AI — ULTIMATE (À vie)",
+        "plans_body": (
+            "✅ Analyses illimitées\n"
+            "✅ Signaux illimités\n"
+            "✅ Support prioritaire\n\n"
+            "🔥 Offre limitée : 49$ (au lieu de 149$)\n"
+        ),
+        "btn_subscribe": "💳 S’abonner — 49$ (ULTIMATE)",
+        "btn_paid": "✅ J’ai payé / Activer",
+        "activate_ask_email": "✉️ Envoyez l’email utilisé pour le paiement Gumroad.\n\n(Ou appuyez sur Annuler)",
+        "btn_cancel": "✖️ Annuler",
+        "activate_cancelled": "✅ Activation annulée.",
+        "invalid_email": "❌ Veuillez envoyer une adresse email valide.",
+        "thanks_email": "✅ Merci ! Email reçu.\nVotre abonnement sera activé après vérification.",
+        "trial_ended": "🔒 Essai gratuit terminé.\nAbonnez-vous pour débloquer l’illimité.",
+        "admin_only": "⛔ Admin seulement.",
+        "setplan_usage": "Usage:\n/setplan <user_id> FREE\n/setplan <user_id> PAID",
+        "setplan_ok": "✅ Plan défini: {uid} = {plan}",
+        "analysis_failed": "❌ Analyse échouée.\nEssayez une image plus claire et assurez-vous que prix/symbole/TF sont visibles.",
+        "header": "━━━━━━━━━━━━━━━━\n🤖 Trading AI — Signal\n━━━━━━━━━━━━━━━━",
         "market_state": "État du marché",
         "market": "Marché",
         "entry": "Zone d’entrée",
-        "note": "Note",
-        "tp": "TP",
         "sl": "SL",
+        "note": "Note",
+        "educational": "📌 Éducatif seulement | Risque 1–2%",
+        "trial_remaining": "🧪 Essai restant : {rem}/{tot}",
+        "subscribe_hint": "S’abonner : /plans (49$ à vie)",
+        "legal_note": "Le momentum soutient ce scénario, mais le marché peut changer rapidement. Gérez le risque.",
+        "signal_buy": "ACHAT",
+        "signal_sell": "VENTE",
+        "bullish": "Haussier",
+        "bearish": "Baissier",
+        "neutral": "Neutre",
+        "strong_mom": "Momentum fort",
+        "mild_mom": "Momentum modéré",
+        "neutral_mom": "Neutre",
+        "low_conv": "Faible conviction",
     },
 }
 
-def lang_name(code: str) -> str:
-    code = (code or "en").lower()
-    if code == "ar":
-        return "Arabic"
-    if code == "fr":
-        return "French"
-    return "English"
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en").strip().lower()
+if DEFAULT_LANG not in LANGS:
+    DEFAULT_LANG = "en"
 
-def lang_kb():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
-            InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
-            InlineKeyboardButton("🇫🇷 Français", callback_data="lang_fr"),
-        ]
-    ])
-
-def main_menu_kb(lang: str):
-    t = UI.get(lang, UI["en"])
-    return ReplyKeyboardMarkup(
-        [
-            [t["btn_analyze"]],
-            [t["btn_plans"], t["btn_help"]],
-            [t["btn_lang"]],
-        ],
-        resize_keyboard=True
-    )
-
-# =========================
+# ============================================================
 # DB helpers
-# =========================
+# ============================================================
 def _now_ts():
     return int(time.time())
 
 def _default_user():
     return {
         "plan": "FREE",
-        "expires_at": 0,   # not used for PAID
+        "expires_at": 0,
         "trial_used": 0,
         "created_at": _now_ts(),
-        "lang": "",        # en/ar/fr
+        "lang": DEFAULT_LANG,
     }
 
 async def load_db():
@@ -272,15 +293,24 @@ async def save_db(db):
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
 async def get_user(db, user_id):
     uid = str(user_id)
     if uid not in db["users"]:
         db["users"][uid] = _default_user()
         await save_db(db)
+    # ensure lang exists
+    if "lang" not in db["users"][uid] or db["users"][uid]["lang"] not in LANGS:
+        db["users"][uid]["lang"] = DEFAULT_LANG
+        await save_db(db)
     return db["users"][uid]
+
+async def set_lang(db, user_id, lang):
+    u = await get_user(db, user_id)
+    u["lang"] = lang
+    await save_db(db)
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 async def set_plan(db, user_id, plan):
     plan = (plan or "").strip().upper()
@@ -295,9 +325,51 @@ async def trial_remaining(u):
     used = int(u.get("trial_used", 0) or 0)
     return max(0, FREE_TRIAL_LIMIT - used)
 
-# =========================
-# TP enforcement helpers (UNCHANGED)
-# =========================
+# ============================================================
+# Menus (INLINE ONLY) - no reply keyboard (prevents email trap)
+# ============================================================
+def lang_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇬🇧 English", callback_data="setlang_en"),
+            InlineKeyboardButton("🇸🇦 العربية", callback_data="setlang_ar"),
+            InlineKeyboardButton("🇫🇷 Français", callback_data="setlang_fr"),
+        ]
+    ])
+
+def main_menu(lang):
+    tt = T[lang]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tt["menu_analyze"], callback_data="menu_analyze")],
+        [
+            InlineKeyboardButton(tt["menu_plans"], callback_data="menu_plans"),
+            InlineKeyboardButton(tt["menu_help"], callback_data="menu_help"),
+        ],
+        [InlineKeyboardButton(tt["menu_lang"], callback_data="menu_lang")],
+    ])
+
+def plans_keyboard(lang):
+    tt = T[lang]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tt["btn_subscribe"], url=GUMROAD_URL)],
+        [InlineKeyboardButton(tt["btn_paid"], callback_data="paid_activate")],
+        [InlineKeyboardButton(tt["menu_lang"], callback_data="menu_lang")],
+    ])
+
+def cancel_keyboard(lang):
+    tt = T[lang]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tt["btn_cancel"], callback_data="cancel_activate")]
+    ])
+
+# ============================================================
+# Pending activation state
+# ============================================================
+PENDING_EMAIL = set()  # user_id set
+
+# ============================================================
+# TP enforcement helpers
+# ============================================================
 _NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 def _extract_floats(text):
@@ -366,53 +438,25 @@ def enforce_tp_rules(result):
     result["tp3"] = _format_price(tp3, decimals)
     return result
 
-# =========================
-# Confidence Messaging (Localized, no logic change)
-# =========================
-def confidence_profile_local(conf, lang):
+# ============================================================
+# Confidence profile -> marketing label (localized)
+# ============================================================
+def confidence_label_key(conf):
     try:
         c = int(conf)
     except Exception:
         c = 50
-
-    # Keep meaning same as your EN version, just translated
-    if lang == "ar":
-        if c >= 80:
-            return ("زخم قوي", "السعر قريب من مناطق إنهاك محتملة. أهداف سريعة مقترحة.")
-        if 70 <= c < 80:
-            return ("زخم متوسط", "الاتجاه نشط. راقب تفاعل السعر عند المستويات المهمة.")
-        if 60 <= c < 70:
-            return ("محايد", "تشكّل هيكل سعري. يفضّل جني أرباح جزئي.")
-        return ("ثقة منخفضة", "وضوح منخفض. انتظر تأكيد وادِر المخاطرة بحذر.")
-
-    if lang == "fr":
-        if c >= 80:
-            return ("Forte dynamique", "Le prix approche d’une zone d’épuisement. Objectifs rapides conseillés.")
-        if 70 <= c < 80:
-            return ("Dynamique modérée", "Tendance active. Surveillez la réaction sur les niveaux clés.")
-        if 60 <= c < 70:
-            return ("Neutre", "La structure se forme. Prise partielle recommandée.")
-        return ("Faible conviction", "Peu de clarté. Attendez une confirmation et gérez le risque.")
-
-    # default EN
     if c >= 80:
-        return ("Strong momentum", "Price is approaching potential exhaustion. Quick targets recommended.")
+        return "strong_mom"
     if 70 <= c < 80:
-        return ("Mild momentum", "Trend is active. Watch price reaction near key levels.")
+        return "mild_mom"
     if 60 <= c < 70:
-        return ("Neutral", "Structure is forming. Momentum is building. Partial profits recommended.")
-    return ("Low conviction", "Low clarity. Wait for confirmation and manage risk carefully.")
+        return "neutral_mom"
+    return "low_conv"
 
-def apply_confidence_messaging(result, lang):
-    conf = int(result.get("confidence", 50) or 50)
-    market_label, note = confidence_profile_local(conf, lang)
-    result["market_label"] = market_label
-    result["note_local"] = note
-    return result
-
-# =========================
-# OpenAI vision call (Responses API) + Language + symbol/tf
-# =========================
+# ============================================================
+# OpenAI vision call (Responses API)
+# ============================================================
 def image_to_base64_jpeg(image_bytes, max_side=1024, quality=85):
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
@@ -423,27 +467,24 @@ def image_to_base64_jpeg(image_bytes, max_side=1024, quality=85):
     img.save(out, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(out.getvalue()).decode("utf-8")
 
-def openai_analyze_chart(b64jpeg, out_lang="en"):
+def openai_analyze_chart(b64jpeg):
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY")
 
-    out_lang = (out_lang or "en").lower()
-    human_lang = lang_name(out_lang)
-
+    # IMPORTANT: We keep core analysis same, just add symbol/timeframe extraction if visible
     prompt = (
-        f"You are a trading assistant analyzing a chart screenshot.\n"
-        f"IMPORTANT: All human-readable text MUST be written in {human_lang}.\n\n"
+        "You are a trading assistant analyzing a chart screenshot.\n"
         "Return STRICT JSON ONLY (no markdown, no extra text) with these keys:\n"
-        "symbol: string (e.g., 'XAUUSD', 'EURUSD', 'BTCUSD') if visible, else ''\n"
-        "timeframe: string (e.g., 'M1','M5','M15','M30','H1','H4','D1') if visible, else ''\n"
+        "symbol: string like 'XAUUSD' or 'EURUSD' or 'BTCUSD' (best guess from chart; if unknown return empty string)\n"
+        "timeframe: string like 'M1','M5','M15','M30','H1','H4','D1' (best guess from chart; if unknown empty)\n"
         "market_state: one of ['Bullish','Bearish','Neutral']\n"
         "signal: one of ['BUY','SELL'] (NEVER return WAIT)\n"
         "confidence: integer 0-100\n"
-        "entry_zone: string like '4420.0 - 4424.0' or 'Breakout above 4435.0' (in chosen language)\n"
+        "entry_zone: string like '4420.0 - 4424.0' or 'Breakout above 4435.0'\n"
         "tp1,tp2,tp3: strings (price levels)\n"
         "sl: string (price level)\n"
-        "caution: short string (in chosen language)\n"
-        "reasoning_short: short 1-2 lines (in chosen language)\n\n"
+        "caution: short string\n"
+        "reasoning_short: short 1-2 lines\n\n"
         "Rules:\n"
         "- If chart is unclear, still give a CONDITIONAL setup (breakout/breakdown) and lower confidence.\n"
         "- Use visible prices from chart when possible.\n"
@@ -453,7 +494,7 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
 
     url = "https://api.openai.com/v1/responses"
     headers = {
-        "Authorization": "Bearer {}".format(OPENAI_API_KEY),
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -464,7 +505,7 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": "data:image/jpeg;base64,{}".format(b64jpeg)}
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64jpeg}"},
                 ],
             }
         ],
@@ -473,7 +514,7 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
 
     r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code >= 400:
-        raise RuntimeError("OpenAI error {}: {}".format(r.status_code, r.text))
+        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
 
     data = r.json()
 
@@ -492,9 +533,10 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
     except Exception:
         m = re.search(r"\{.*\}", out_text, re.S)
         if not m:
-            raise RuntimeError("Invalid JSON from model: {}".format(out_text[:300]))
+            raise RuntimeError(f"Invalid JSON from model: {out_text[:300]}")
         parsed = json.loads(m.group(0))
 
+    # defaults
     parsed.setdefault("symbol", "")
     parsed.setdefault("timeframe", "")
     parsed.setdefault("market_state", "Neutral")
@@ -505,9 +547,10 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
     parsed.setdefault("tp2", "N/A")
     parsed.setdefault("tp3", "N/A")
     parsed.setdefault("sl", "N/A")
-    parsed.setdefault("caution", "")
+    parsed.setdefault("caution", "Use risk management.")
     parsed.setdefault("reasoning_short", "")
 
+    # sanitize
     try:
         parsed["confidence"] = int(parsed["confidence"])
     except Exception:
@@ -521,31 +564,26 @@ def openai_analyze_chart(b64jpeg, out_lang="en"):
         ms = "Neutral"
     parsed["market_state"] = ms
 
-    # normalize symbol/tf
-    parsed["symbol"] = (parsed.get("symbol") or "").strip().upper()
-    parsed["timeframe"] = (parsed.get("timeframe") or "").strip().upper()
+    sym = str(parsed.get("symbol", "") or "").upper().strip()
+    tf = str(parsed.get("timeframe", "") or "").upper().strip()
+    # normalize timeframe
+    if tf and tf not in ("M1", "M5", "M15", "M30", "H1", "H4", "D1"):
+        tf = ""
+    parsed["symbol"] = sym
+    parsed["timeframe"] = tf
 
     return parsed
 
-def normalize_tf(x: str) -> str:
-    x = (x or "").strip().upper().replace(" ", "")
-    x = x.replace("MIN", "M").replace("MINS", "M")
-    x = x.replace("HOUR", "H").replace("HOURS", "H")
-    if x.isdigit():
-        return "M" + x
-    # 5M -> M5
-    if re.match(r"^\d+M$", x):
-        return "M" + x[:-1]
-    # keep common ones
-    return x
-
-def guess_symbol_tf(caption):
+# ============================================================
+# Fallback symbol/tf from caption (optional)
+# ============================================================
+def guess_symbol_tf_from_caption(caption):
     if not caption:
         return "", ""
     cap = caption.upper()
     sym = ""
     tf = ""
-    for s in ["XAUUSD", "GOLD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]:
+    for s in ["XAUUSD", "GOLD", "BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "USDJPY", "US30", "NAS100", "SPX", "WTI", "BRENT"]:
         if s in cap:
             sym = "XAUUSD" if s == "GOLD" else s
             break
@@ -554,151 +592,113 @@ def guess_symbol_tf(caption):
         tf = m.group(1)
     return sym, tf
 
-def translate_market_state(ms, lang):
-    ms = (ms or "Neutral").capitalize()
-    if lang == "ar":
-        return {"Bullish": "صاعد", "Bearish": "هابط", "Neutral": "محايد"}.get(ms, "محايد")
-    if lang == "fr":
-        return {"Bullish": "Haussier", "Bearish": "Baissier", "Neutral": "Neutre"}.get(ms, "Neutre")
-    return ms
+# ============================================================
+# Formatting (PRO header + localized labels)
+# ============================================================
+def localize_market_state(lang, ms):
+    tt = T[lang]
+    if ms == "Bullish":
+        return tt["bullish"]
+    if ms == "Bearish":
+        return tt["bearish"]
+    return tt["neutral"]
 
-def translate_signal(sig, lang):
-    sig = (sig or "BUY").upper()
-    if lang == "ar":
-        return "شراء" if sig == "BUY" else "بيع"
-    if lang == "fr":
-        return "ACHAT" if sig == "BUY" else "VENTE"
-    return sig
+def localize_signal(lang, sig):
+    tt = T[lang]
+    return tt["signal_buy"] if sig == "BUY" else tt["signal_sell"]
 
-def format_signal_message(lang, symbol_hint, timeframe_hint, result, trial_line):
-    t = UI.get(lang, UI["en"])
+def format_signal_message(lang, symbol, timeframe, result, trial_line):
+    tt = T[lang]
 
     ms = result["market_state"]
     sig = result["signal"]
-    conf = result["confidence"]
-    entry = result["entry_zone"]
-    tp1, tp2, tp3 = result["tp1"], result["tp2"], result["tp3"]
-    sl = result["sl"]
+    conf = int(result.get("confidence", 50) or 50)
+    entry = str(result.get("entry_zone", "N/A") or "N/A")
+    tp1, tp2, tp3 = str(result.get("tp1", "N/A")), str(result.get("tp2", "N/A")), str(result.get("tp3", "N/A"))
+    sl = str(result.get("sl", "N/A"))
 
-    market_label = result.get("market_label", "")
-    note_local = result.get("note_local", "")
-    reasoning = (result.get("reasoning_short") or "").strip()
-    caution = (result.get("caution") or "").strip()
-
+    # Emojis
     state_emoji = "📈" if ms == "Bullish" else ("📉" if ms == "Bearish" else "⏸️")
     sig_emoji = "🟢" if sig == "BUY" else "🔴"
 
-    sym = symbol_hint or "SYMBOL"
-    tf = timeframe_hint or "TF"
+    # Localized text
+    ms_local = localize_market_state(lang, ms)
+    sig_local = localize_signal(lang, sig)
 
-    ms_local = translate_market_state(ms, lang)
-    sig_local = translate_signal(sig, lang)
+    label_key = confidence_label_key(conf)
+    market_label = tt[label_key]
 
-    # Message: clean & professional
-    msg = (
-        f"{sig_emoji} {sig_local} | {sym} | {tf} | {conf}%\n"
-        f"{state_emoji} {t['market_state']}: {ms_local}\n"
-    )
-    if market_label:
-        msg += f"🧭 {t['market']}: {market_label}\n"
+    sym = symbol or "SYMBOL"
+    tf = timeframe or "TF"
 
-    msg += (
-        f"\n🎯 {t['entry']}: {entry}\n"
-        f"✅ {t['tp']}1: {tp1}\n"
-        f"✅ {t['tp']}2: {tp2}\n"
-        f"✅ {t['tp']}3: {tp3}\n"
-        f"🛑 {t['sl']}: {sl}\n"
-    )
+    # ✅ PRO header
+    header = tt["header"]
 
-    # Notes in selected language
-    if note_local or reasoning or caution:
-        msg += "\n"
-    if note_local:
-        msg += f"🧠 {t['note']}: {note_local}\n"
-    if reasoning:
-        msg += f"📌 {reasoning}\n"
-    if caution:
-        msg += f"⚠️ {caution}\n"
+    # ✅ Legal note (short, safe)
+    legal_note = tt["legal_note"]
+
+    lines = []
+    lines.append(header)
+    lines.append(f"{sig_emoji} {sig_local} | {sym} | {tf} | {conf}%")
+    lines.append(f"{state_emoji} {tt['market_state']}: {ms_local}")
+    lines.append(f"🧭 {tt['market']}: {market_label}")
+    lines.append("")
+    lines.append(f"🎯 {tt['entry']}: {entry}")
+    lines.append(f"✅ TP1: {tp1}")
+    lines.append(f"✅ TP2: {tp2}")
+    lines.append(f"✅ TP3: {tp3}")
+    lines.append(f"🛑 {tt['sl']}: {sl}")
+    lines.append("")
+    lines.append(f"🧠 {tt['note']}: {legal_note}")
 
     if trial_line:
-        msg += f"\n{trial_line}\n"
+        lines.append("")
+        lines.append(trial_line)
 
-    msg += f"\n{t['edu']}"
-    return msg
+    lines.append("")
+    lines.append(tt["educational"])
+    return "\n".join(lines)
 
-# =========================
-# UX state: "Analyze" mode (no menu under)
-# =========================
-AWAITING_PHOTO = {}  # user_id -> True
-
-# =========================
-# Telegram Handlers
-# =========================
+# ============================================================
+# Handlers
+# ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     db = await load_db()
-    u = await get_user(db, update.effective_user.id)
-    lang = (u.get("lang") or "").strip().lower()
+    u = await get_user(db, user_id)
+    lang = u.get("lang", DEFAULT_LANG)
 
-    # If no language yet -> show language selection (like Noro)
-    if lang not in LANGS:
-        await update.message.reply_text(UI["en"]["choose_lang"], reply_markup=lang_kb())
-        return
-
-    # If language set -> show clean welcome + main menu
-    t = UI[lang]
-    await update.message.reply_text(
-        t["menu_title"],
-        reply_markup=main_menu_kb(lang)
-    )
-
-async def cb_set_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    lang = query.data.replace("lang_", "").strip().lower()
-    if lang not in LANGS:
-        lang = "en"
-
-    db = await load_db()
-    u = await get_user(db, query.from_user.id)
-    u["lang"] = lang
-    await save_db(db)
-
-    t = UI[lang]
-    # After language set -> show menu
-    await query.message.reply_text(t["lang_set"])
-    await query.message.reply_text(t["menu_title"], reply_markup=main_menu_kb(lang))
+    # Always show language selection first (Noro style)
+    await update.message.reply_text(T[lang]["choose_lang"], reply_markup=lang_keyboard())
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text("✅ Your ID: {}".format(uid))
+    await update.message.reply_text(f"✅ Your ID: {uid}")
 
 async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     db = await load_db()
-    u = await get_user(db, update.effective_user.id)
-    lang = (u.get("lang") or "en").lower()
-    t = UI.get(lang, UI["en"])
+    u = await get_user(db, user_id)
+    lang = u.get("lang", DEFAULT_LANG)
+    tt = T[lang]
 
-    await update.message.reply_text(
-        t["plans_text_html"],
-        parse_mode="HTML",
-        reply_markup=offer_keyboard()
-    )
+    msg = f"{tt['plans_title']}\n\n{tt['plans_body']}"
+    await update.message.reply_text(msg, reply_markup=plans_keyboard(lang))
 
 async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin only:
-      /setplan <user_id> FREE
-      /setplan <user_id> PAID
-    """
     uid = update.effective_user.id
+    db = await load_db()
+    u = await get_user(db, uid)
+    lang = u.get("lang", DEFAULT_LANG)
+    tt = T[lang]
+
     if not is_admin(uid):
-        await update.message.reply_text("⛔ Admin only.")
+        await update.message.reply_text(tt["admin_only"])
         return
 
     parts = (update.message.text or "").split()
     if len(parts) != 3:
-        await update.message.reply_text("Usage:\n/setplan <user_id> FREE\n/setplan <user_id> PAID")
+        await update.message.reply_text(tt["setplan_usage"])
         return
 
     target_id = parts[1].strip()
@@ -711,101 +711,83 @@ async def cmd_setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid plan. Use FREE or PAID.")
         return
 
-    db = await load_db()
     await set_plan(db, int(target_id), plan)
-    await update.message.reply_text("✅ Set {} plan={}".format(target_id, plan))
+    await update.message.reply_text(tt["setplan_ok"].format(uid=target_id, plan=plan))
 
-async def paid_activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_welcome_and_menu(chat_id, context, lang):
+    tt = T[lang]
+    # Welcome card (fancy + simple)
+    db = await load_db()
+    u = await get_user(db, chat_id)
+    rem = await trial_remaining(u)
+
+    welcome = (
+        f"{tt['welcome_title']}\n\n"
+        f"{tt['welcome_body']}\n"
+        f"{tt['free_trial'].format(n=FREE_TRIAL_LIMIT)}\n"
+        f"{tt['trial_remaining'].format(rem=rem, tot=FREE_TRIAL_LIMIT)}"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=welcome, reply_markup=main_menu(lang))
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid = query.from_user.id
 
+    user_id = query.from_user.id
     db = await load_db()
-    u = await get_user(db, uid)
-    lang = (u.get("lang") or "en").lower()
-    t = UI.get(lang, UI["en"])
+    u = await get_user(db, user_id)
+    lang = u.get("lang", DEFAULT_LANG)
 
-    PENDING_EMAIL[uid] = True
-    await query.message.reply_text(t["send_email"])
+    data = query.data or ""
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    db = await load_db()
-    u = await get_user(db, uid)
-    lang = (u.get("lang") or "").lower()
-    t = UI.get(lang if lang in LANGS else "en", UI["en"])
-
-    txt = (update.message.text or "").strip()
-
-    # If waiting for payment email
-    if uid in PENDING_EMAIL:
-        if "@" not in txt or "." not in txt:
-            await update.message.reply_text(t["invalid_email"])
-            return
-
-        del PENDING_EMAIL[uid]
-
-        username = update.effective_user.username or "NoUsername"
-        cmd_ready = f"/setplan {uid} PAID"
-
-        msg_admin = (
-            "💰 Payment Request\n\n"
-            f"👤 User: @{username}\n"
-            f"🆔 ID: {uid}\n"
-            f"📧 Email: {txt}\n\n"
-            "✅ Verify in Gumroad → Sales (search by email)\n\n"
-            f"⚡ Activate command (copy/paste):\n{cmd_ready}\n\n"
-            f"(Admin email ref: {ADMIN_EMAIL})"
-        )
-
-        if not ADMIN_IDS:
-            await update.message.reply_text(t["admin_missing"])
-            return
-
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=msg_admin)
-            except Exception:
-                pass
-
-        await update.message.reply_text(t["email_received"], reply_markup=main_menu_kb(lang))
+    # Language menu
+    if data == "menu_lang":
+        await query.message.reply_text(T[lang]["choose_lang"], reply_markup=lang_keyboard())
         return
 
-    # Language button
-    if txt == t["btn_lang"]:
-        await update.message.reply_text(t["choose_lang"], reply_markup=lang_kb())
+    # Set language
+    if data.startswith("setlang_"):
+        new_lang = data.split("_", 1)[1].strip().lower()
+        if new_lang not in LANGS:
+            new_lang = DEFAULT_LANG
+        await set_lang(db, user_id, new_lang)
+
+        # Do NOT break activation state; just confirm and show menu
+        await query.message.reply_text(T[new_lang]["lang_set"])
+        await send_welcome_and_menu(query.message.chat_id, context, new_lang)
         return
 
-    # Plans button
-    if txt == t["btn_plans"]:
-        await update.message.reply_text(t["plans_text_html"], parse_mode="HTML", reply_markup=offer_keyboard())
-        return
-
-    # Help button
-    if txt == t["btn_help"]:
-        await update.message.reply_text(t["help_text_html"], parse_mode="HTML", reply_markup=main_menu_kb(lang))
-        return
-
-    # Analyze button: IMPORTANT -> no menu under + only "send chart" (no extra options)
-    if txt == t["btn_analyze"]:
-        AWAITING_PHOTO[uid] = True
-        await update.message.reply_text(
-            t["send_chart_only"],
-            reply_markup=ReplyKeyboardRemove()
+    # Plans
+    if data == "menu_plans":
+        await query.message.reply_text(
+            f"{T[lang]['plans_title']}\n\n{T[lang]['plans_body']}",
+            reply_markup=plans_keyboard(lang)
         )
         return
 
-    # If user typed /start etc handled elsewhere
-    if txt.startswith("/"):
+    # Help
+    if data == "menu_help":
+        await query.message.reply_text(T[lang]["help_text"], reply_markup=main_menu(lang))
         return
 
-    # Otherwise gentle hint (no spam)
-    if lang not in LANGS:
-        await update.message.reply_text(t["need_lang"], reply_markup=lang_kb())
+    # Analyze (just prompt to send photo; no extra menus)
+    if data == "menu_analyze":
+        # Mark awaiting photo (UX)
+        context.user_data["awaiting_photo"] = True
+        await query.message.reply_text(T[lang]["send_chart_now"])
         return
 
-    # If they send random text, keep it clean
-    await update.message.reply_text(t["send_chart_only"], reply_markup=ReplyKeyboardRemove())
+    # Activation flow
+    if data == "paid_activate":
+        PENDING_EMAIL.add(user_id)
+        await query.message.reply_text(T[lang]["activate_ask_email"], reply_markup=cancel_keyboard(lang))
+        return
+
+    if data == "cancel_activate":
+        if user_id in PENDING_EMAIL:
+            PENDING_EMAIL.discard(user_id)
+        await query.message.reply_text(T[lang]["activate_cancelled"], reply_markup=main_menu(lang))
+        return
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -813,85 +795,133 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db = await load_db()
     u = await get_user(db, user_id)
+    lang = u.get("lang", DEFAULT_LANG)
+    tt = T[lang]
 
-    lang = (u.get("lang") or "").lower()
-    if lang not in LANGS:
-        await msg.reply_text(UI["en"]["choose_lang"], reply_markup=lang_kb())
-        return
+    # If user was asked for email, and they send photo => ignore email state, analyze photo (more pro UX)
+    if user_id in PENDING_EMAIL:
+        # keep pending activation, but allow analysis
+        pass
 
-    t = UI[lang]
     plan = (u.get("plan", "FREE") or "FREE").upper()
 
-    # FREE limit
     if plan == "FREE":
         rem = await trial_remaining(u)
         if rem <= 0:
-            await msg.reply_text(
-                t["trial_ended"] + OFFER_TEXT_HTML,
-                parse_mode="HTML",
-                reply_markup=offer_keyboard()
-            )
+            await msg.reply_text(tt["trial_ended"], reply_markup=plans_keyboard(lang))
             return
 
-    # Direct analyze immediately (no extra questions)
     await msg.chat.send_action(ChatAction.TYPING)
-    await msg.reply_text(t["analyzing"], reply_markup=ReplyKeyboardRemove())
 
     photo = msg.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     b = await file.download_as_bytearray()
 
     caption = msg.caption or ""
-    sym_hint, tf_hint = guess_symbol_tf(caption)
+    sym_cap, tf_cap = guess_symbol_tf_from_caption(caption)
 
     try:
         b64 = image_to_base64_jpeg(bytes(b), max_side=1100, quality=85)
-        result = await asyncio.to_thread(openai_analyze_chart, b64, lang)
 
-        # Use model symbol/tf if available
-        model_sym = (result.get("symbol") or "").strip().upper()
-        model_tf = normalize_tf(result.get("timeframe") or "")
-        if model_sym:
-            sym_hint = model_sym
-        if model_tf:
-            tf_hint = model_tf
+        # Analyze with OpenAI (thread)
+        result = await asyncio.to_thread(openai_analyze_chart, b64)
 
-        # Keep your TP logic unchanged
+        # TP rules (keep your marketing TP1 close)
         result = enforce_tp_rules(result)
 
-        # Localized confidence note (no change in scoring)
-        result = apply_confidence_messaging(result, lang)
+        # Determine symbol/tf:
+        sym_img = (result.get("symbol", "") or "").strip().upper()
+        tf_img = (result.get("timeframe", "") or "").strip().upper()
 
+        symbol = sym_img or sym_cap or ""
+        timeframe = tf_img or tf_cap or ""
+
+        # Trial update
         trial_line = ""
         if plan == "FREE":
             u["trial_used"] = int(u.get("trial_used", 0) or 0) + 1
             await save_db(db)
             rem_after = await trial_remaining(u)
-            trial_line = t["trial_remaining"].format(rem=rem_after, limit=FREE_TRIAL_LIMIT)
+            trial_line = (
+                tt["trial_remaining"].format(rem=rem_after, tot=FREE_TRIAL_LIMIT) + "\n" +
+                tt["subscribe_hint"]
+            )
 
-        text = format_signal_message(lang, sym_hint, tf_hint, result, trial_line)
+        text = format_signal_message(lang, symbol, timeframe, result, trial_line)
 
-        # restore main menu after result (no extra "choose" message)
-        AWAITING_PHOTO.pop(user_id, None)
-        await msg.reply_text(text, reply_markup=main_menu_kb(lang))
+        # ✅ IMPORTANT: Do NOT send menu after analysis (as you requested)
+        await msg.reply_text(text)
+
+        # After successful analysis, no longer "awaiting_photo"
+        context.user_data["awaiting_photo"] = False
 
     except Exception as e:
-        AWAITING_PHOTO.pop(user_id, None)
-        await msg.reply_text(
-            "❌ Analysis failed.\n"
-            "Try a clearer screenshot (zoom candles) and make sure price/symbol/TF are visible.\n\n"
-            "Debug: {}".format(str(e)[:300]),
-            reply_markup=main_menu_kb(lang)
+        await msg.reply_text(f"{tt['analysis_failed']}\n\nDebug: {str(e)[:220]}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    t = (update.message.text or "").strip()
+
+    db = await load_db()
+    u = await get_user(db, user_id)
+    lang = u.get("lang", DEFAULT_LANG)
+    tt = T[lang]
+
+    # Activation email step
+    if user_id in PENDING_EMAIL:
+        # Allow user to still change language or open plans without being trapped
+        # But since our buttons are INLINE, this mostly happens if they type manually.
+        if t.startswith("/"):
+            return
+
+        # Validate email
+        if "@" not in t or "." not in t or len(t) < 6:
+            await update.message.reply_text(tt["invalid_email"], reply_markup=cancel_keyboard(lang))
+            return
+
+        # accept
+        PENDING_EMAIL.discard(user_id)
+
+        username = update.effective_user.username or "NoUsername"
+        cmd_ready = f"/setplan {user_id} PAID"
+
+        msg_admin = (
+            "💰 Payment Request\n\n"
+            f"👤 User: @{username}\n"
+            f"🆔 ID: {user_id}\n"
+            f"📧 Email: {t}\n\n"
+            "✅ Verify in Gumroad → Sales (search by email)\n\n"
+            f"⚡ Activate command (copy/paste):\n{cmd_ready}\n\n"
+            f"(Admin email ref: {ADMIN_EMAIL})"
         )
 
-# =========================
+        if ADMIN_IDS:
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=msg_admin)
+                except Exception:
+                    pass
+
+        await update.message.reply_text(tt["thanks_email"], reply_markup=main_menu(lang))
+        return
+
+    # Normal chat text: guide user to send screenshot
+    if t.startswith("/"):
+        return
+
+    # If user typed random text, keep it clean and pro:
+    await update.message.reply_text(tt["send_chart_now"])
+
+# ============================================================
 # Main
-# =========================
+# ============================================================
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not OPENAI_API_KEY:
+        print("WARNING: OPENAI_API_KEY missing. Analysis will fail.")
     if not ADMIN_IDS:
-        print("WARNING: ADMIN_IDS is empty. /setplan will not work and payment requests won't reach you.")
+        print("WARNING: ADMIN_IDS is empty. Payment requests won't reach you and /setplan won't work.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -900,13 +930,8 @@ async def main():
     app.add_handler(CommandHandler("plans", cmd_plans))
     app.add_handler(CommandHandler("setplan", cmd_setplan))
 
-    # Language selection callbacks
-    app.add_handler(CallbackQueryHandler(cb_set_lang, pattern=r"^lang_(en|ar|fr)$"))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Button callback for "I Paid / Activate"
-    app.add_handler(CallbackQueryHandler(paid_activate, pattern="^paid_activate$"))
-
-    # Photo + Text
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
